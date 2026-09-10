@@ -1387,7 +1387,7 @@ export async function listSourceRegistryDb() {
   if (!pool) return [];
   const result = await pool.query(`select id, name, base_url as "baseUrl", source_type as "sourceType",
     authority_score::float as "authorityScore", crawl_enabled as "crawlEnabled", respect_robots as "respectRobots",
-    max_pages_per_run as "maxPagesPerRun", crawl_delay_ms as "crawlDelayMs", last_crawled_at as "lastCrawledAt"
+    max_pages_per_run as "maxPagesPerRun", crawl_delay_ms as "crawlDelayMs", metadata, last_crawled_at as "lastCrawledAt"
     from source_registry order by authority_score desc, name`);
   return result.rows;
 }
@@ -1396,7 +1396,7 @@ export async function getSourceRegistryDb(id:string) {
   if (!pool) return null;
   const result = await pool.query(`select id, name, base_url as "baseUrl", source_type as "sourceType",
     authority_score::float as "authorityScore", crawl_enabled as "crawlEnabled", respect_robots as "respectRobots",
-    max_pages_per_run as "maxPagesPerRun", crawl_delay_ms as "crawlDelayMs", last_crawled_at as "lastCrawledAt"
+    max_pages_per_run as "maxPagesPerRun", crawl_delay_ms as "crawlDelayMs", metadata, last_crawled_at as "lastCrawledAt"
     from source_registry where id=$1`, [id]);
   return result.rows[0] ?? null;
 }

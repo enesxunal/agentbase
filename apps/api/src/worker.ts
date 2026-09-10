@@ -25,6 +25,25 @@ const WORKER_ID = process.env.AGENTBASE_WORKER_ID || `${os.hostname()}:${process
 const POLL_MS = Math.max(500, Number(process.env.WORKER_POLL_MS || 1500));
 let stopping = false;
 
+type CrawlMetadata = {
+  allowedPathPrefixes?: string[];
+  deniedPathPrefixes?: string[];
+  allowedQueryKeys?: string[];
+};
+
+function normalizeDiscoveredUrl(rawUrl: string, metadata: CrawlMetadata) {
+  const url = new URL(rawUrl);
+  if (metadata.allowedPathPrefixes?.length && !metadata.allowedPathPrefixes.some((prefix) => url.pathname.startsWith(prefix))) return null;
+  if (metadata.deniedPathPrefixes?.some((prefix) => url.pathname.startsWith(prefix))) return null;
+  if (metadata.allowedQueryKeys?.length) {
+    for (const key of [...url.searchParams.keys()]) {
+      if (!metadata.allowedQueryKeys.includes(key)) url.searchParams.delete(key);
+    }
+  }
+  url.hash = '';
+  return url.toString();
+}
+
 async function runSourceRegistry(sourceId: string) {
   const source = await getSourceRegistryDb(sourceId);
   if (!source) throw new Error('source_registry_not_found');
@@ -33,6 +52,7 @@ async function runSourceRegistry(sourceId: string) {
   const batch = await claimSourceFrontierBatchDb(sourceId, source.maxPagesPerRun);
   const stats = { sourceId, processed: batch.length, completed: 0, failed: 0, blocked: 0, discovered: 0 };
   const sourceOrigin = new URL(source.baseUrl).origin;
+  const crawlMetadata = (source.metadata ?? {}) as CrawlMetadata;
 
   for (const item of batch) {
     try {
@@ -59,7 +79,9 @@ async function runSourceRegistry(sourceId: string) {
       if (item.depth < 2) {
         const links = await discoverSameOriginLinks(item.url, 50);
         for (const link of links) {
-          await enqueueSourceUrlDb(sourceId, link, item.depth + 1, item.url);
+          const normalized = normalizeDiscoveredUrl(link, crawlMetadata);
+          if (!normalized) continue;
+          await enqueueSourceUrlDb(sourceId, normalized, item.depth + 1, item.url);
           stats.discovered++;
         }
       }
