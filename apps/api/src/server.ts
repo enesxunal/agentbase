@@ -898,7 +898,15 @@ app.get("/.well-known/agent-card.json", async () => ({
   ]
 }));
 
-app.all("/mcp", async (request, reply) => {
+app.all("/mcp", { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } }, async (request, reply) => {
+  const authorization = request.headers.authorization;
+  if (authorization?.startsWith("Bearer ")) {
+    const token = authorization.slice(7).trim();
+    const agent = token ? await authenticateAgentTokenDb(hashToken(token)) : null;
+    if (!agent) return reply.status(401).send({ error: "invalid_agent_token" });
+    const raw = request.raw as typeof request.raw & { auth?: { token: string; clientId: string; scopes: string[] } };
+    raw.auth = { token, clientId: agent.id, scopes: agent.verified ? ["agent", "verified"] : ["agent"] };
+  }
   reply.hijack();
   await mcpNodeHandler(request.raw, reply.raw, request.body);
 });

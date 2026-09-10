@@ -1,7 +1,11 @@
-import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
+import { createMcpHandler, McpServer, type McpRequestContext } from '@modelcontextprotocol/server';
 import { toNodeHandler } from '@modelcontextprotocol/node';
 import { z } from 'zod';
 import {
+  createAgentEventDb,
+  createAgentReviewDb,
+  createContributionDb,
+  getEntityAgentScoreDb,
   getEntityDb,
   getFactsDb,
   getRelationsDb,
@@ -32,7 +36,7 @@ async function resolveEntity(idOrSlug: string) {
   return matches.find((item) => item.slug === idOrSlug || item.name.toLocaleLowerCase('tr-TR') === idOrSlug.toLocaleLowerCase('tr-TR')) ?? null;
 }
 
-function createAgentBaseMcpServer() {
+function createAgentBaseMcpServer(ctx: McpRequestContext) {
   const server = new McpServer(
     { name: 'agentbase', version: '0.5.0' },
     { capabilities: { tools: {} } }
@@ -96,6 +100,75 @@ function createAgentBaseMcpServer() {
     const entity = await resolveEntity(id);
     if (!entity) return toolError('entity_not_found');
     return toolResult({ entityId: entity.id, relations: await getRelationsDb(entity.id) });
+  });
+
+  server.registerTool('submit_rating', {
+    description: 'Dogrulanmis agent kimligiyle bir entity icin Agent Experience puanlari gonderir. Puanlar 1-5 arasindadir.',
+    inputSchema: z.object({
+      id: z.string().min(1),
+      accuracy: z.number().min(1).max(5).optional(),
+      freshness: z.number().min(1).max(5).optional(),
+      completeness: z.number().min(1).max(5).optional(),
+      machineReadability: z.number().min(1).max(5).optional(),
+      comment: z.string().max(1000).optional()
+    }).refine((value) => value.accuracy != null || value.freshness != null || value.completeness != null || value.machineReadability != null, {
+      message: 'at_least_one_rating_required'
+    })
+  }, async ({ id, accuracy, freshness, completeness, machineReadability, comment }) => {
+    if (!ctx.authInfo?.clientId) return toolError('authentication_required');
+    if (!ctx.authInfo.scopes.includes('verified')) return toolError('verified_agent_required');
+    const entity = await resolveEntity(id);
+    if (!entity) return toolError('entity_not_found');
+    const review = await createAgentReviewDb({
+      agentId: ctx.authInfo.clientId,
+      entityId: entity.id,
+      accuracy,
+      freshness,
+      completeness,
+      machineReadability,
+      comment
+    });
+    if (!review) return toolError('database_required');
+    await createAgentEventDb({
+      agentId: ctx.authInfo.clientId,
+      entityId: entity.id,
+      eventType: 'entity_rated',
+      payload: { message: 'Dogrulanmis bir agent entity verisini degerlendirdi', source: 'mcp' }
+    });
+    return toolResult({ accepted: true, review, agentScore: await getEntityAgentScoreDb(entity.id) });
+  });
+
+  server.registerTool('submit_contribution', {
+    description: 'Kimligi dogrulanmis bir AgentBase agent tokeniyle yeni bilgi, duzeltme, kaynak veya iliski onerisi gonderir. Katki dogrudan canonical fact olmaz; inceleme kuyruguna girer.',
+    inputSchema: z.object({
+      id: z.string().min(1).optional(),
+      contributionType: z.enum(['fact_add', 'fact_update', 'source_add', 'error_report', 'relation_add']),
+      payload: z.record(z.string(), z.unknown()),
+      evidence: z.array(z.unknown()).max(20).default([])
+    })
+  }, async ({ id, contributionType, payload, evidence }) => {
+    if (!ctx.authInfo?.clientId) return toolError('authentication_required');
+    let entityId: string | undefined;
+    if (id) {
+      const entity = await resolveEntity(id);
+      if (!entity) return toolError('entity_not_found');
+      entityId = entity.id;
+    }
+    const contribution = await createContributionDb({
+      agentId: ctx.authInfo.clientId,
+      entityId,
+      contributionType,
+      payload,
+      evidence
+    });
+    if (!contribution) return toolError('database_required');
+    await createAgentEventDb({
+      agentId: ctx.authInfo.clientId,
+      entityId,
+      eventType: 'contribution_submitted',
+      payload: { message: 'Bir agent bilgi katkisi gonderdi', contributionType, source: 'mcp' }
+    });
+    return toolResult({ accepted: true, reviewStatus: 'pending', contribution });
   });
 
   return server;
