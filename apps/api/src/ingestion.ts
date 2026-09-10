@@ -2,6 +2,7 @@ import * as cheerio from "cheerio";
 import { createHash } from "node:crypto";
 import { extractRichTextClaims } from "./rich_extraction.js";
 import { extractClaimsWithLlm, llmExtractionConfigured } from "./llm_extraction.js";
+import { safeFetchText } from "./fetch_security.js";
 
 export type CrawledDocument = {
   url: string;
@@ -71,28 +72,22 @@ function parseJsonLd($: cheerio.CheerioAPI) {
 }
 
 export async function crawlUrl(url: string): Promise<CrawledDocument> {
-  const parsed = new URL(url);
-  if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('unsupported_protocol');
-
-  const response = await fetch(parsed.toString(), {
-    redirect: 'follow',
+  const { response, body, finalUrl } = await safeFetchText(url, {
     headers: {
       'user-agent': 'AgentBaseBot/0.1 (+https://agentbase.com.tr/bot)',
       accept: 'text/html,application/xhtml+xml,application/json;q=0.8,*/*;q=0.5'
-    },
-    signal: AbortSignal.timeout(15000)
+    }
   });
 
   const contentType = response.headers.get('content-type');
-  const body = await response.text();
   const bodyHash = createHash('sha256').update(body).digest('hex');
 
   if (contentType?.includes('application/json')) {
     let parsedJson: unknown = null;
     try { parsedJson = JSON.parse(body); } catch {}
     return {
-      url: response.url,
-      canonicalUrl: response.url,
+      url: finalUrl,
+      canonicalUrl: finalUrl,
       title: null,
       description: null,
       contentType,
@@ -109,7 +104,7 @@ export async function crawlUrl(url: string): Promise<CrawledDocument> {
   const $ = cheerio.load(body);
   $('script:not([type="application/ld+json"]),style,noscript,svg').remove();
   const canonical = $('link[rel="canonical"]').attr('href') || null;
-  const resolvedCanonical = canonical ? new URL(canonical, response.url).toString() : response.url;
+  const resolvedCanonical = canonical ? new URL(canonical, finalUrl).toString() : finalUrl;
   const title = normalizeText($('title').first().text()) || null;
   const description = $('meta[name="description"]').attr('content')?.trim() || null;
   const rawText = normalizeText($('main').text() || $('article').text() || $('body').text()).slice(0, 250000);
@@ -124,7 +119,7 @@ export async function crawlUrl(url: string): Promise<CrawledDocument> {
   };
 
   return {
-    url: response.url,
+    url: finalUrl,
     canonicalUrl: resolvedCanonical,
     title,
     description,
@@ -215,9 +210,8 @@ export async function robotsAllows(url: string, userAgent = 'AgentBaseBot') {
   const target = new URL(url);
   const robotsUrl = new URL('/robots.txt', target.origin).toString();
   try {
-    const response = await fetch(robotsUrl, { headers: { 'user-agent': `${userAgent}/0.1 (+https://agentbase.com.tr/bot)` }, signal: AbortSignal.timeout(8000) });
+    const { response, body: text } = await safeFetchText(robotsUrl, { headers: { 'user-agent': `${userAgent}/0.1 (+https://agentbase.com.tr/bot)` } }, 512 * 1024);
     if (!response.ok) return { allowed: true, robotsUrl, reason: 'robots_unavailable' };
-    const text = await response.text();
     const lines = text.split(/\r?\n/).map((line) => line.replace(/#.*/, '').trim()).filter(Boolean);
     let applies = false;
     const disallow: string[] = [];
@@ -247,22 +241,19 @@ export async function robotsAllows(url: string, userAgent = 'AgentBaseBot') {
 }
 
 export async function discoverSameOriginLinks(url: string, maxLinks = 100) {
-  const response = await fetch(url, {
-    redirect: 'follow',
-    headers: { 'user-agent': 'AgentBaseBot/0.1 (+https://agentbase.com.tr/bot)', accept: 'text/html,*/*;q=0.5' },
-    signal: AbortSignal.timeout(15000)
+  const { response, body, finalUrl } = await safeFetchText(url, {
+    headers: { 'user-agent': 'AgentBaseBot/0.1 (+https://agentbase.com.tr/bot)', accept: 'text/html,*/*;q=0.5' }
   });
   const contentType = response.headers.get('content-type') || '';
   if (!contentType.includes('text/html')) return [] as string[];
-  const body = await response.text();
   const $ = cheerio.load(body);
-  const origin = new URL(response.url).origin;
+  const origin = new URL(finalUrl).origin;
   const out = new Set<string>();
   $('a[href]').each((_, el) => {
     const href = $(el).attr('href');
     if (!href || href.startsWith('#') || href.startsWith('mailto:') || href.startsWith('tel:') || href.startsWith('javascript:')) return;
     try {
-      const resolved = new URL(href, response.url);
+      const resolved = new URL(href, finalUrl);
       if (resolved.origin !== origin || !['http:','https:'].includes(resolved.protocol)) return;
       resolved.hash = '';
       if (/\.(?:jpg|jpeg|png|gif|webp|svg|pdf|zip|rar|mp4|mp3)$/i.test(resolved.pathname)) return;
