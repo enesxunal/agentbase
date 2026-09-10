@@ -135,6 +135,14 @@ export async function crawlUrl(url: string): Promise<CrawledDocument> {
 }
 
 function derivePageSubjectName(document: CrawledDocument) {
+  // muze.gov.tr detail pages often use the H1 for a marketing slogan while the
+  // HTML title carries the canonical museum/site name.
+  try {
+    const target = new URL(document.url);
+    if ((target.hostname === 'muze.gov.tr' || target.hostname === 'www.muze.gov.tr') && target.pathname === '/muze-detay' && document.title) {
+      return document.title.trim().slice(0, 160);
+    }
+  } catch {}
   const h1 = typeof document.metadata?.h1 === 'string' ? String(document.metadata.h1).trim() : '';
   if (h1 && h1.length <= 160) return h1;
   if (!document.title) return null;
@@ -142,9 +150,54 @@ function derivePageSubjectName(document: CrawledDocument) {
   return (parts[0] || document.title).slice(0,160);
 }
 
+function extractOfficialMuseumClaims(document: CrawledDocument, subjectName: string | null) {
+  const claims: Array<{ subjectName: string | null; subjectType?: string | null; predicate: string; value: unknown; confidence: number; evidence?: string }> = [];
+  if (!subjectName) return claims;
+  let target: URL;
+  try { target = new URL(document.url); } catch { return claims; }
+  const host = target.hostname.toLowerCase();
+  if (!(host === 'muze.gov.tr' || host === 'www.muze.gov.tr') || target.pathname !== '/muze-detay') return claims;
+
+  const subjectType = /müze|museum/i.test(subjectName) ? 'Museum' : 'TouristAttraction';
+  const base = { subjectName, subjectType };
+  const text = document.rawText;
+  const one = (pattern: RegExp) => text.match(pattern)?.[1]?.replace(/\s+/g, ' ').trim() || null;
+
+  claims.push({ ...base, predicate: 'schema:name', value: subjectName, confidence: 0.97, evidence: 'Official muze.gov.tr detail page title' });
+  claims.push({ ...base, predicate: 'schema:url', value: document.canonicalUrl || document.url, confidence: 0.97, evidence: 'Official muze.gov.tr detail page URL' });
+
+  const opening = one(/Açılış Saati:\s*(\d{1,2}:\d{2})/i);
+  const closing = one(/Kapanış Saati:\s*(\d{1,2}:\d{2})/i);
+  if (opening && closing && !(opening === '00:00' && closing === '00:00')) {
+    claims.push({ ...base, predicate: 'schema:openingHours', value: `${opening}-${closing}`, confidence: 0.95, evidence: 'Official muze.gov.tr opening/closing fields' });
+  }
+
+  const closedDays = one(/Kapalı Günler\s+(.+?)(?=\s+Adres:)/i);
+  if (closedDays) claims.push({ ...base, predicate: 'ab:closedDays', value: closedDays, confidence: 0.94, evidence: 'Official muze.gov.tr closed-days field' });
+
+  const address = one(/Adres:\s*(.+?)(?=\s+E-?mail:|\s+Tel\s*1:)/i);
+  if (address && address.length >= 5 && address.length <= 300) {
+    claims.push({ ...base, predicate: 'schema:address', value: address, confidence: 0.96, evidence: 'Official muze.gov.tr address field' });
+  }
+
+  const email = one(/E-?mail:\s*([^\s]+@[^\s]+\.[^\s]+)/i);
+  if (email) claims.push({ ...base, predicate: 'schema:email', value: email, confidence: 0.97, evidence: 'Official muze.gov.tr email field' });
+
+  const phone = one(/Tel\s*1:\s*([+()\d\s.-]{10,24})/i);
+  if (phone && phone.replace(/\D/g, '').length >= 10) {
+    claims.push({ ...base, predicate: 'schema:telephone', value: phone, confidence: 0.97, evidence: 'Official muze.gov.tr telephone field' });
+  }
+
+  const description = one(/Açıklama\s+(.{40,2000}?)(?=\s+(?:Fotoğraf|Galeri|Harita|Konum|İletişim|©|T\.C\.)\b|$)/i);
+  if (description) claims.push({ ...base, predicate: 'schema:description', value: description, confidence: 0.92, evidence: 'Official muze.gov.tr description section' });
+
+  return claims;
+}
+
 export function extractClaims(document: CrawledDocument) {
   const claims: Array<{ subjectName: string | null; subjectType?: string | null; predicate: string; value: unknown; confidence: number; evidence?: string }> = [];
   const pageSubjectName = derivePageSubjectName(document);
+  claims.push(...extractOfficialMuseumClaims(document, pageSubjectName));
 
   for (const node of document.jsonld) {
     const items = typeof node === 'object' && node && '@graph' in (node as Record<string, unknown>)

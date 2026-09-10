@@ -1441,6 +1441,7 @@ const AUTO_REVIEW_PREDICATES = new Set([
   'schema:description',
   'schema:address',
   'schema:telephone',
+  'schema:email',
   'schema:url',
   'schema:openingHours',
   'schema:servesCuisine',
@@ -1461,7 +1462,10 @@ export async function autoReviewPendingClaimsDb(sourceRegistryId?: string, limit
             c.target_entity_id as "targetEntityId", d.source_registry_id as "sourceRegistryId",
             sr.source_type as "sourceType", sr.authority_score::float as "authorityScore",
             coalesce((select max(rc.score)::float from entity_resolution_candidates rc
-                      where rc.claim_id=c.id and rc.status='accepted'),0)::float as "resolutionScore"
+                      where rc.claim_id=c.id and rc.status='accepted'),
+                     case when c.auto_entity_created or exists (
+                       select 1 from entity_creation_audit eca where eca.entity_id=c.target_entity_id
+                     ) then 1.0 else 0 end)::float as "resolutionScore"
        from extracted_claims c
        join source_documents d on d.id=c.document_id
        left join source_registry sr on sr.id=d.source_registry_id
