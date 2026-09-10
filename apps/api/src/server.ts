@@ -5,6 +5,7 @@ import { z } from "zod";
 import { entities, sources } from "./data.js";
 import { crawlUrl, extractClaimsAsync, robotsAllows, discoverSameOriginLinks } from "./ingestion.js";
 import { parseQuery } from "./retrieval.js";
+import { mcpNodeHandler } from "./mcp_server.js";
 import {
   authenticateAgentTokenDb,
   createAgentDb,
@@ -818,106 +819,9 @@ app.get("/.well-known/agent-card.json", async () => ({
   ]
 }));
 
-app.post("/mcp", async (request, reply) => {
-  const body = request.body as { jsonrpc?: string; id?: string | number | null; method?: string; params?: any };
-  const id = body?.id ?? null;
-  const result = (value: unknown) => ({ jsonrpc: "2.0", id, result: value });
-
-  if (body?.jsonrpc !== "2.0" || !body.method) {
-    return reply.status(400).send({ jsonrpc: "2.0", id, error: { code: -32600, message: "Invalid Request" } });
-  }
-
-  if (body.method === "initialize") {
-    return result({
-      protocolVersion: "2025-06-18",
-      capabilities: { tools: {} },
-      serverInfo: { name: "agentbase", version: "0.4.0" }
-    });
-  }
-
-  if (body.method === "tools/list") {
-    return result({
-      tools: [
-        {
-          name: "search",
-          description: "AgentBase bilgi ağında doğal dil ile arama yapar.",
-          inputSchema: {
-            type: "object",
-            properties: { query: { type: "string" }, type: { type: "string" }, limit: { type: "number" } },
-            required: ["query"]
-          }
-        },
-        {
-          name: "retrieve",
-          description: "Doğal dil sorgusunu intent, şehir, facet ve güven sinyalleriyle çözüp agent-ready context döndürür.",
-          inputSchema: {
-            type: "object",
-            properties: { query: { type: "string" }, limit: { type: "number" } },
-            required: ["query"]
-          }
-        },
-        {
-          name: "get_entity",
-          description: "Bir AgentBase entity kaydını ID veya slug ile getirir.",
-          inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] }
-        },
-        {
-          name: "get_sources",
-          description: "Bir entity'nin kaynak ve provenance kayıtlarını getirir.",
-          inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] }
-        },
-        {
-          name: "get_related",
-          description: "Bir entity ile ilişkili diğer entity kayıtlarını getirir.",
-          inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] }
-        }
-      ]
-    });
-  }
-
-  if (body.method === "tools/call") {
-    const name = body.params?.name;
-    const args = body.params?.arguments ?? {};
-
-    if (name === "search") {
-      const payload = await searchKnowledge(String(args.query || ""), args.type, Number(args.limit || 10));
-      return result({ content: [{ type: "text", text: JSON.stringify(payload) }], structuredContent: { results: payload } });
-    }
-
-    if (name === "retrieve") {
-      const query = String(args.query || "");
-      const cities = await listKnownCitiesDb();
-      const intent = parseQuery(query, cities);
-      const payload = await semanticHybridRetrieveDb(intent, Math.min(25, Math.max(1, Number(args.limit || 10))));
-      const structuredContent = { query, retrievalMode: "semantic-hybrid-v2", intent, results: payload };
-      return result({ content: [{ type: "text", text: JSON.stringify(structuredContent) }], structuredContent });
-    }
-
-    if (name === "get_entity") {
-      const entity = await resolveEntity(String(args.id || ""));
-      if (!entity) return result({ isError: true, content: [{ type: "text", text: "entity_not_found" }] });
-      return result({ content: [{ type: "text", text: JSON.stringify(entity) }], structuredContent: entity });
-    }
-
-    if (name === "get_sources") {
-      const entity = await resolveEntity(String(args.id || ""));
-      if (!entity) return result({ isError: true, content: [{ type: "text", text: "entity_not_found" }] });
-      const payload = await getSourcesDb(entity.id);
-      return result({ content: [{ type: "text", text: JSON.stringify(payload) }], structuredContent: { sources: payload } });
-    }
-
-    if (name === "get_related") {
-      const entity = await resolveEntity(String(args.id || ""));
-      if (!entity) return result({ isError: true, content: [{ type: "text", text: "entity_not_found" }] });
-      const payload = await getRelationsDb(entity.id);
-      return result({ content: [{ type: "text", text: JSON.stringify(payload) }], structuredContent: { relations: payload } });
-    }
-
-    return result({ isError: true, content: [{ type: "text", text: "unknown_tool" }] });
-  }
-
-  if (body.method === "notifications/initialized") return reply.status(204).send();
-  return reply.status(404).send({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });
+app.all("/mcp", async (request, reply) => {
+  reply.hijack();
+  await mcpNodeHandler(request.raw, reply.raw, request.body);
 });
 
 const port = Number(process.env.PORT || 4000);
