@@ -15,7 +15,8 @@
     "db:logs": "docker compose -f infra/docker-compose.yml logs -f postgres",
     "build": "npm run build -w @agentbase/api && npm run build -w @agentbase/web",
     "dev:worker": "npm run dev:worker -w @agentbase/api",
-    "worker": "npm run worker -w @agentbase/api"
+    "worker": "npm run worker -w @agentbase/api",
+    "db:migrate": "npm run migrate -w @agentbase/api"
   },
   "devDependencies": {
     "concurrently": "^9.2.1"

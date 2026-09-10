@@ -7,7 +7,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "dev:worker": "tsx watch src/worker.ts",
-    "worker": "node dist/worker.js"
+    "worker": "node dist/worker.js",
+    "migrate": "node scripts/migrate.mjs"
   },
   "dependencies": {
     "@fastify/cors": "^11.1.0",
