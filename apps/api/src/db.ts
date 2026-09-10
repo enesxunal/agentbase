@@ -1535,3 +1535,114 @@ export async function getEntityFactsAtDb(entityId: string, at: string) {
   );
   return result.rows;
 }
+
+export type BackgroundJob = {
+  id: string;
+  jobType: string;
+  payload: Record<string, unknown>;
+  status: 'queued'|'running'|'completed'|'failed'|'cancelled';
+  priority: number;
+  attempts: number;
+  maxAttempts: number;
+  runAfter: string;
+  lockedAt: string | null;
+  lockedBy: string | null;
+  lastError: string | null;
+  result: unknown;
+  createdAt: string;
+  updatedAt: string;
+  completedAt: string | null;
+};
+
+export async function enqueueBackgroundJobDb(jobType: string, payload: Record<string, unknown>, options?: { priority?: number; maxAttempts?: number; runAfter?: string }) {
+  if (!pool) return null;
+  const result = await pool.query(
+    `insert into background_jobs (job_type,payload,priority,max_attempts,run_after)
+     values ($1,$2::jsonb,$3,$4,coalesce($5::timestamptz,now()))
+     returning id, job_type as "jobType", payload, status, priority, attempts, max_attempts as "maxAttempts",
+       run_after as "runAfter", locked_at as "lockedAt", locked_by as "lockedBy", last_error as "lastError",
+       result, created_at as "createdAt", updated_at as "updatedAt", completed_at as "completedAt"`,
+    [jobType, JSON.stringify(payload), options?.priority ?? 100, options?.maxAttempts ?? 3, options?.runAfter ?? null]
+  );
+  return result.rows[0] as BackgroundJob;
+}
+
+export async function claimBackgroundJobDb(workerId: string, jobTypes: string[] = []) {
+  if (!pool) return null;
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const params: unknown[] = [];
+    let typeFilter = '';
+    if (jobTypes.length) {
+      params.push(jobTypes);
+      typeFilter = ` and job_type = any($${params.length}::text[])`;
+    }
+    params.push(workerId);
+    const result = await client.query(
+      `with picked as (
+         select id from background_jobs
+          where ((status='queued' and run_after <= now()) or (status='running' and locked_at < now() - interval '30 minutes')) ${typeFilter}
+          order by priority asc, created_at asc
+          limit 1 for update skip locked
+       )
+       update background_jobs j
+          set status='running', attempts=attempts+1, locked_at=now(), locked_by=$${params.length}, updated_at=now()
+         from picked where j.id=picked.id
+       returning j.id, j.job_type as "jobType", j.payload, j.status, j.priority, j.attempts,
+         j.max_attempts as "maxAttempts", j.run_after as "runAfter", j.locked_at as "lockedAt",
+         j.locked_by as "lockedBy", j.last_error as "lastError", j.result,
+         j.created_at as "createdAt", j.updated_at as "updatedAt", j.completed_at as "completedAt"`, params);
+    await client.query('commit');
+    return (result.rows[0] ?? null) as BackgroundJob | null;
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally { client.release(); }
+}
+
+export async function completeBackgroundJobDb(id: string, resultValue: unknown) {
+  if (!pool) return null;
+  const result = await pool.query(
+    `update background_jobs set status='completed', result=$2::jsonb, last_error=null,
+       completed_at=now(), locked_at=null, locked_by=null, updated_at=now()
+     where id=$1 returning id,status,completed_at as "completedAt"`, [id, JSON.stringify(resultValue ?? null)]);
+  return result.rows[0] ?? null;
+}
+
+export async function failBackgroundJobDb(id: string, error: string, retryDelaySeconds = 30) {
+  if (!pool) return null;
+  const result = await pool.query(
+    `update background_jobs
+        set status=case when attempts < max_attempts then 'queued' else 'failed' end,
+            run_after=case when attempts < max_attempts then now() + make_interval(secs => $3) else run_after end,
+            last_error=$2, locked_at=null, locked_by=null, updated_at=now()
+      where id=$1
+      returning id,status,attempts,max_attempts as "maxAttempts",run_after as "runAfter",last_error as "lastError"`,
+    [id, error.slice(0,2000), Math.max(1,retryDelaySeconds)]);
+  return result.rows[0] ?? null;
+}
+
+export async function getBackgroundJobDb(id: string) {
+  if (!pool) return null;
+  const result = await pool.query(
+    `select id, job_type as "jobType", payload, status, priority, attempts, max_attempts as "maxAttempts",
+      run_after as "runAfter", locked_at as "lockedAt", locked_by as "lockedBy", last_error as "lastError",
+      result, created_at as "createdAt", updated_at as "updatedAt", completed_at as "completedAt"
+      from background_jobs where id=$1`, [id]);
+  return result.rows[0] ?? null;
+}
+
+export async function listBackgroundJobsDb(limit = 50, status?: string) {
+  if (!pool) return [];
+  const params: unknown[] = [];
+  let filter = '';
+  if (status) { params.push(status); filter = ` where status=$${params.length}`; }
+  params.push(limit);
+  const result = await pool.query(
+    `select id, job_type as "jobType", payload, status, priority, attempts, max_attempts as "maxAttempts",
+      run_after as "runAfter", locked_at as "lockedAt", locked_by as "lockedBy", last_error as "lastError",
+      result, created_at as "createdAt", updated_at as "updatedAt", completed_at as "completedAt"
+      from background_jobs ${filter} order by created_at desc limit $${params.length}`, params);
+  return result.rows;
+}

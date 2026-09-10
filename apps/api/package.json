@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "dev:worker": "tsx watch src/worker.ts",
+    "worker": "node dist/worker.js"
   },
   "dependencies": {
     "@fastify/cors": "^11.1.0",

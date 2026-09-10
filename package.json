@@ -1,7 +1,10 @@
 {
   "name": "agentbase",
   "private": true,
-  "workspaces": ["apps/*", "packages/*"],
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
     "dev": "concurrently -n web,api \"npm run dev -w @agentbase/web\" \"npm run dev -w @agentbase/api\"",
     "dev:local": "DATABASE_URL=postgres://agentbase:agentbase@127.0.0.1:54329/agentbase NEXT_PUBLIC_AGENTBASE_API=http://127.0.0.1:4000 npm run dev",
@@ -10,7 +13,9 @@
     "db:up": "docker compose -f infra/docker-compose.yml up -d",
     "db:down": "docker compose -f infra/docker-compose.yml down",
     "db:logs": "docker compose -f infra/docker-compose.yml logs -f postgres",
-    "build": "npm run build -w @agentbase/api && npm run build -w @agentbase/web"
+    "build": "npm run build -w @agentbase/api && npm run build -w @agentbase/web",
+    "dev:worker": "npm run dev:worker -w @agentbase/api",
+    "worker": "npm run worker -w @agentbase/api"
   },
   "devDependencies": {
     "concurrently": "^9.2.1"

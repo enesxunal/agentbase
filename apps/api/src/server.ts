@@ -58,7 +58,10 @@ import {
   autoReviewPendingClaimsDb,
   listAutoReviewRunsDb,
   autoCreateEntitiesDb,
-  listEntityCreationAuditDb
+  listEntityCreationAuditDb,
+  enqueueBackgroundJobDb,
+  getBackgroundJobDb,
+  listBackgroundJobsDb
 } from "./db.js";
 
 const app = Fastify({ logger: true });
@@ -539,8 +542,12 @@ app.post('/v1/ingest/url', async (request, reply) => {
 
   const job = await createIngestionJobDb(parsed.data.url, agent.id);
   if (!job) return reply.status(503).send({ error: 'database_required' });
-  void runIngestion(job.id, parsed.data.url);
-  return reply.status(202).send({ job });
+  const backgroundJob = await enqueueBackgroundJobDb('ingest_url', { ingestionJobId: job.id, url: parsed.data.url, requestedByAgentId: agent.id }, { priority: 60, maxAttempts: 3 });
+  if (!backgroundJob) {
+    await finishIngestionJobDb(job.id, 'failed', {}, 'background_queue_unavailable');
+    return reply.status(503).send({ error: 'background_queue_unavailable' });
+  }
+  return reply.status(202).send({ job, backgroundJob });
 });
 
 app.get('/v1/ingest/jobs/:id', async (request, reply) => {
@@ -776,9 +783,27 @@ app.post('/v1/sources/registry/:id/run', async (request, reply) => {
   const { id } = request.params as { id: string };
   const source = await getSourceRegistryDb(id);
   if (!source) return reply.status(404).send({ error: 'source_registry_not_found' });
-  const stats = await runSourceRegistry(id);
-  await createAgentEventDb({ agentId: agent.id, eventType: 'source_crawl_completed', payload: { message: source.name + ' kaynağı tarandı', ...stats } });
-  return { source, stats };
+  const job = await enqueueBackgroundJobDb('source_crawl', { sourceId: id, requestedByAgentId: agent.id }, { priority: 50, maxAttempts: 3 });
+  if (!job) return reply.status(503).send({ error: 'database_required' });
+  await createAgentEventDb({ agentId: agent.id, eventType: 'source_crawl_queued', payload: { message: source.name + ' kaynağı tarama kuyruğuna eklendi', sourceId: id, jobId: job.id } });
+  return reply.status(202).send({ source, job });
+});
+
+app.get('/v1/jobs/:id', async (request, reply) => {
+  const agent = await requireAgent(request);
+  if (!agent || !agent.verified) return reply.status(403).send({ error: 'verified_agent_required' });
+  const { id } = request.params as { id: string };
+  const job = await getBackgroundJobDb(id);
+  if (!job) return reply.status(404).send({ error: 'job_not_found' });
+  return { job };
+});
+
+app.get('/v1/jobs', async (request, reply) => {
+  const agent = await requireAgent(request);
+  if (!agent || !agent.verified) return reply.status(403).send({ error: 'verified_agent_required' });
+  const q = request.query as { limit?: string; status?: string };
+  const limit = Math.min(200, Math.max(1, Number(q.limit || 50)));
+  return { jobs: await listBackgroundJobsDb(limit, q.status) };
 });
 
 app.get("/.well-known/agent-card.json", async () => ({
