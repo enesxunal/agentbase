@@ -215,21 +215,114 @@ export async function createAgentTokenDb(agentId: string, tokenHash: string, lab
   return true;
 }
 
-export async function authenticateAgentTokenDb(tokenHash: string) {
+export type AuthenticatedAgent = DbAgent & {
+  tokenId: string;
+  tokenLabel: string;
+  rateLimitPerMinute: number;
+  dailyQuota: number;
+  dailyUsage: number;
+};
+
+export async function authenticateAgentTokenDb(tokenHash: string): Promise<AuthenticatedAgent | null> {
+  if (!pool) return null;
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const result = await client.query(
+      `update agent_tokens t
+          set last_used_at = now()
+         from agents a
+        where t.token_hash = $1
+          and t.revoked_at is null
+          and (t.expires_at is null or t.expires_at > now())
+          and a.id = t.agent_id
+        returning a.id, a.name, a.developer, a.website, a.description,
+                  a.verified, a.reputation::float,
+                  a.created_at as "createdAt", a.updated_at as "updatedAt",
+                  t.id as "tokenId", t.label as "tokenLabel",
+                  t.rate_limit_per_minute as "rateLimitPerMinute",
+                  t.daily_quota as "dailyQuota"`,
+      [tokenHash]
+    );
+    const agent = result.rows[0];
+    if (!agent) { await client.query('rollback'); return null; }
+    const usage = await client.query(
+      `insert into agent_api_usage (agent_id, usage_date, request_count)
+       values ($1, current_date, 1)
+       on conflict (agent_id, usage_date) do update
+         set request_count = agent_api_usage.request_count + 1, updated_at=now()
+       returning request_count::int as count`, [agent.id]
+    );
+    const dailyUsage = Number(usage.rows[0]?.count ?? 0);
+    if (dailyUsage > Number(agent.dailyQuota)) {
+      await client.query('rollback');
+      return null;
+    }
+    await client.query('commit');
+    return { ...agent, dailyUsage } as AuthenticatedAgent;
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally { client.release(); }
+}
+
+export async function listAgentTokensDb(agentId: string) {
+  if (!pool) return [];
+  const result = await pool.query(
+    `select id, label, created_at as "createdAt", last_used_at as "lastUsedAt",
+            revoked_at as "revokedAt", expires_at as "expiresAt",
+            rate_limit_per_minute as "rateLimitPerMinute", daily_quota as "dailyQuota"
+       from agent_tokens where agent_id=$1 order by created_at desc`, [agentId]
+  );
+  return result.rows;
+}
+
+export async function revokeAgentTokenDb(agentId: string, tokenId: string) {
   if (!pool) return null;
   const result = await pool.query(
-    `update agent_tokens t
-        set last_used_at = now()
-       from agents a
-      where t.token_hash = $1
-        and t.revoked_at is null
-        and a.id = t.agent_id
-      returning a.id, a.name, a.developer, a.website, a.description,
-                a.verified, a.reputation::float,
-                a.created_at as "createdAt", a.updated_at as "updatedAt"`,
-    [tokenHash]
+    `update agent_tokens set revoked_at=coalesce(revoked_at,now())
+      where id=$1 and agent_id=$2
+      returning id, label, revoked_at as "revokedAt"`, [tokenId, agentId]
   );
-  return (result.rows[0] as DbAgent | undefined) ?? null;
+  return result.rows[0] ?? null;
+}
+
+export async function createManagedAgentTokenDb(input: { agentId: string; tokenHash: string; label: string; expiresAt?: string | null; rateLimitPerMinute?: number; dailyQuota?: number }) {
+  if (!pool) return null;
+  const result = await pool.query(
+    `insert into agent_tokens (agent_id, token_hash, label, expires_at, rate_limit_per_minute, daily_quota)
+     values ($1,$2,$3,$4,$5,$6)
+     returning id,label,created_at as "createdAt",expires_at as "expiresAt",
+       rate_limit_per_minute as "rateLimitPerMinute",daily_quota as "dailyQuota"`,
+    [input.agentId,input.tokenHash,input.label,input.expiresAt ?? null,input.rateLimitPerMinute ?? 120,input.dailyQuota ?? 10000]
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function rotateAgentTokenDb(input: { agentId: string; currentTokenId: string; tokenHash: string; label: string; expiresAt?: string | null; rateLimitPerMinute?: number; dailyQuota?: number }) {
+  if (!pool) return null;
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const current = await client.query(
+      `select id from agent_tokens where id=$1 and agent_id=$2 and revoked_at is null for update`,
+      [input.currentTokenId, input.agentId]
+    );
+    if (!current.rowCount) { await client.query('rollback'); return null; }
+    const created = await client.query(
+      `insert into agent_tokens (agent_id, token_hash, label, expires_at, rate_limit_per_minute, daily_quota)
+       values ($1,$2,$3,$4,$5,$6)
+       returning id,label,created_at as "createdAt",expires_at as "expiresAt",
+         rate_limit_per_minute as "rateLimitPerMinute",daily_quota as "dailyQuota"`,
+      [input.agentId,input.tokenHash,input.label,input.expiresAt ?? null,input.rateLimitPerMinute ?? 120,input.dailyQuota ?? 10000]
+    );
+    await client.query(`update agent_tokens set revoked_at=now() where id=$1`, [input.currentTokenId]);
+    await client.query('commit');
+    return created.rows[0] ?? null;
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally { client.release(); }
 }
 
 export async function recentPublicEvents(limit = 20) {

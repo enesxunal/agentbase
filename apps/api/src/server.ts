@@ -1,5 +1,6 @@
 import Fastify, { type FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
+import rateLimit from "@fastify/rate-limit";
 import { createHash, randomBytes } from "node:crypto";
 import { z } from "zod";
 import { entities, sources } from "./data.js";
@@ -60,13 +61,33 @@ import {
   listAutoReviewRunsDb,
   autoCreateEntitiesDb,
   listEntityCreationAuditDb,
+  listAgentTokensDb,
+  revokeAgentTokenDb,
+  createManagedAgentTokenDb,
+  rotateAgentTokenDb,
   enqueueBackgroundJobDb,
   getBackgroundJobDb,
   listBackgroundJobsDb
 } from "./db.js";
 
-const app = Fastify({ logger: true });
-await app.register(cors, { origin: true });
+const app = Fastify({
+  logger: true,
+  bodyLimit: Number(process.env.API_BODY_LIMIT_BYTES || 1024 * 1024),
+  trustProxy: process.env.TRUST_PROXY === 'true'
+});
+const corsOrigins = (process.env.CORS_ORIGINS || '').split(',').map((v) => v.trim()).filter(Boolean);
+await app.register(cors, {
+  origin: process.env.NODE_ENV === 'production' ? corsOrigins : true,
+  methods: ['GET','POST','DELETE','OPTIONS'],
+  allowedHeaders: ['content-type','authorization','mcp-protocol-version','mcp-method']
+});
+await app.register(rateLimit, {
+  global: true,
+  max: Number(process.env.GLOBAL_RATE_LIMIT_PER_MINUTE || 300),
+  timeWindow: "1 minute",
+  allowList: (request) => process.env.NODE_ENV !== "production" && ["127.0.0.1", "::1"].includes(request.ip),
+  errorResponseBuilder: (_request, context) => ({ statusCode: 429, error: "rate_limit_exceeded", message: `Rate limit exceeded, retry in ${context.after}`, retryAfterMs: context.ttl })
+});
 
 const memoryAgents = [
   {
@@ -410,7 +431,7 @@ const registerAgentSchema = z.object({
   description: z.string().max(500).optional()
 });
 
-app.post("/v1/agents/register", async (request, reply) => {
+app.post("/v1/agents/register", { config: { rateLimit: { max: 5, timeWindow: "1 minute" } } }, async (request, reply) => {
   const parsed = registerAgentSchema.safeParse(request.body);
   if (!parsed.success) return reply.status(400).send({ error: "invalid_agent", details: parsed.error.flatten() });
   const health = await dbHealth();
@@ -428,6 +449,56 @@ app.post("/v1/agents/register", async (request, reply) => {
     token,
     tokenWarning: "Bu token yalnızca bir kez gösterilir. Güvenli bir yerde saklayın."
   });
+});
+
+const managedTokenSchema = z.object({
+  label: z.string().min(1).max(80).default('api-key'),
+  expiresAt: z.string().datetime().optional(),
+  rateLimitPerMinute: z.number().int().min(1).max(10000).default(120),
+  dailyQuota: z.number().int().min(1).max(10000000).default(10000)
+});
+
+app.get('/v1/agents/me/tokens', async (request, reply) => {
+  const agent = await requireAgent(request);
+  if (!agent) return reply.status(401).send({ error: 'invalid_agent_token' });
+  return { tokens: await listAgentTokensDb(agent.id), dailyUsage: agent.dailyUsage, dailyQuota: agent.dailyQuota };
+});
+
+app.post('/v1/agents/me/tokens', { config: { rateLimit: { max: 10, timeWindow: '1 hour' } } }, async (request, reply) => {
+  const agent = await requireAgent(request);
+  if (!agent) return reply.status(401).send({ error: 'invalid_agent_token' });
+  const parsed = managedTokenSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.status(400).send({ error: 'invalid_token_settings', details: parsed.error.flatten() });
+  const token = `ab_live_${randomBytes(24).toString('base64url')}`;
+  const tokenRecord = await createManagedAgentTokenDb({ agentId: agent.id, tokenHash: hashToken(token), ...parsed.data });
+  if (!tokenRecord) return reply.status(503).send({ error: 'database_required' });
+  return reply.status(201).send({ token, tokenRecord, tokenWarning: 'Bu token yalnızca bir kez gösterilir.' });
+});
+
+app.delete('/v1/agents/me/tokens/:tokenId', async (request, reply) => {
+  const agent = await requireAgent(request);
+  if (!agent) return reply.status(401).send({ error: 'invalid_agent_token' });
+  const { tokenId } = request.params as { tokenId: string };
+  if (tokenId === agent.tokenId) return reply.status(400).send({ error: 'cannot_revoke_current_token' });
+  const revoked = await revokeAgentTokenDb(agent.id, tokenId);
+  if (!revoked) return reply.status(404).send({ error: 'token_not_found' });
+  return { revoked };
+});
+
+app.post('/v1/agents/me/tokens/rotate', { config: { rateLimit: { max: 5, timeWindow: '1 hour' } } }, async (request, reply) => {
+  const agent = await requireAgent(request);
+  if (!agent) return reply.status(401).send({ error: 'invalid_agent_token' });
+  const parsed = managedTokenSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.status(400).send({ error: 'invalid_token_settings', details: parsed.error.flatten() });
+  const token = `ab_live_${randomBytes(24).toString('base64url')}`;
+  const tokenRecord = await rotateAgentTokenDb({
+    agentId: agent.id,
+    currentTokenId: agent.tokenId,
+    tokenHash: hashToken(token),
+    ...parsed.data
+  });
+  if (!tokenRecord) return reply.status(409).send({ error: 'token_rotation_failed' });
+  return reply.status(201).send({ token, tokenRecord, tokenWarning: 'Eski token iptal edildi. Yeni token yalnızca bir kez gösterilir.' });
 });
 
 app.get("/v1/activity", async (request) => {
@@ -533,7 +604,7 @@ async function runIngestion(jobId: string, url: string) {
   }
 }
 
-app.post('/v1/ingest/url', async (request, reply) => {
+app.post('/v1/ingest/url', { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } }, async (request, reply) => {
   const agent = await requireAgent(request);
   if (!agent) return reply.status(401).send({ error: 'invalid_agent_token' });
   const parsed = ingestUrlSchema.safeParse(request.body);
@@ -777,7 +848,7 @@ app.get('/v1/ingest/auto-review/runs', async (request) => {
   return { runs: await listAutoReviewRunsDb(limit) };
 });
 
-app.post('/v1/sources/registry/:id/run', async (request, reply) => {
+app.post('/v1/sources/registry/:id/run', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (request, reply) => {
   const agent = await requireAgent(request);
   if (!agent) return reply.status(401).send({ error: 'invalid_agent_token' });
   if (!agent.verified) return reply.status(403).send({ error: 'verified_agent_required' });

@@ -27,6 +27,22 @@ try {
     .filter((file) => /^\d+_.+\.sql$/.test(file))
     .sort((a, b) => a.localeCompare(b));
 
+  const baseline = Number(process.env.MIGRATION_BASELINE || 0);
+  if (baseline > 0) {
+    const count = await client.query('select count(*)::int as count from schema_migrations');
+    if (Number(count.rows[0]?.count ?? 0) !== 0) {
+      throw new Error('MIGRATION_BASELINE can only be used when schema_migrations is empty');
+    }
+    for (const filename of files) {
+      const prefix = Number(filename.split('_', 1)[0]);
+      if (prefix > baseline) continue;
+      const sql = await fs.readFile(path.join(migrationsDir, filename), 'utf8');
+      const checksum = crypto.createHash('sha256').update(sql).digest('hex');
+      await client.query('insert into schema_migrations (filename, checksum) values ($1,$2)', [filename, checksum]);
+      console.log(`baseline ${filename}`);
+    }
+  }
+
   for (const filename of files) {
     const sql = await fs.readFile(path.join(migrationsDir, filename), 'utf8');
     const checksum = crypto.createHash('sha256').update(sql).digest('hex');
