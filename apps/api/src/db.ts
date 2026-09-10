@@ -1194,6 +1194,24 @@ export async function hybridRetrieveDb(intent: QueryIntent, limit = 10) {
     const freshnessDays = Math.max(0, (Date.now() - new Date(row.updatedAt).getTime()) / 86400000);
     const freshness = Math.max(0.35, Math.exp(-freshnessDays / 365));
 
+    const eventStartFact = row.type === 'event' ? facts.find((f: any) => f.predicate === 'schema:startDate') : null;
+    const eventStartAt = eventStartFact && typeof eventStartFact.value === 'string' ? eventStartFact.value : null;
+    const eventStartMs = eventStartAt ? new Date(eventStartAt).getTime() : Number.NaN;
+    let temporalMatch = true;
+    let temporalScore = row.type === 'event' ? 0.35 : 0;
+    if (intent.temporal) {
+      const fromMs = new Date(intent.temporal.from).getTime();
+      const toMs = intent.temporal.to ? new Date(intent.temporal.to).getTime() : Number.POSITIVE_INFINITY;
+      temporalMatch = row.type === 'event' && Number.isFinite(eventStartMs) && eventStartMs >= fromMs && eventStartMs < toMs;
+      if (temporalMatch) {
+        const daysAway = Math.max(0, (eventStartMs - Date.now()) / 86400000);
+        temporalScore = Math.max(0.4, Math.exp(-daysAway / 30));
+      } else temporalScore = 0;
+    } else if (row.type === 'event' && Number.isFinite(eventStartMs)) {
+      const daysFromNow = (eventStartMs - Date.now()) / 86400000;
+      temporalScore = daysFromNow >= 0 ? Math.max(0.4, Math.exp(-daysFromNow / 60)) : 0.05;
+    }
+
     const exactName = normalizeQuery(String(row.name)) === intent.normalized ? 1 : 0;
     const nameContains = intent.normalized && normalizeQuery(String(row.name)).includes(intent.normalized) ? 1 : 0;
 
@@ -1205,7 +1223,8 @@ export async function hybridRetrieveDb(intent: QueryIntent, limit = 10) {
       cityScore * 0.07 +
       typeScore * 0.05 +
       trust * 0.05 +
-      freshness * 0.02
+      freshness * 0.02 +
+      (row.type === 'event' ? temporalScore * 0.08 : 0)
     );
 
     const matchedFacts = facts
@@ -1232,15 +1251,18 @@ export async function hybridRetrieveDb(intent: QueryIntent, limit = 10) {
         city: cityScore,
         type: typeScore,
         trust: Number(trust.toFixed(3)),
-        freshness: Number(freshness.toFixed(3))
+        freshness: Number(freshness.toFixed(3)),
+        temporal: Number(temporalScore.toFixed(3))
       },
+      eventStartAt,
+      temporalMatch,
       facts: matchedFacts.length ? matchedFacts : facts.slice(0, 5),
       sources: sources.slice(0, 5)
     };
   });
 
   return scored
-    .filter((row) => row.score >= 0.08)
+    .filter((row) => row.score >= 0.08 && (!intent.temporal || row.temporalMatch))
     .sort((a,b) => b.score-a.score || b.confidence-a.confidence)
     .slice(0, limit);
 }
@@ -1343,11 +1365,13 @@ export async function semanticHybridRetrieveDb(intent: QueryIntent, limit = 10) 
       base = {
         id: s.id, slug: s.slug, type: s.type, name: s.name, summary: s.summary,
         location: s.location, confidence: Number(s.confidence ?? 0), updatedAt: s.updatedAt,
-        score: 0, reasons: { lexical: 0, facets: 0, city: 0, type: 0, trust: Number(s.confidence ?? 0), freshness: 1 },
+        score: 0, reasons: { lexical: 0, facets: 0, city: 0, type: 0, trust: Number(s.confidence ?? 0), freshness: 1, temporal: 0 },
+        eventStartAt: null, temporalMatch: !intent.temporal,
         facts: full?.facts?.slice(0, 5) ?? [], sources: full?.sources?.slice(0, 5) ?? []
       };
     }
     if (!base) continue;
+    if (intent.temporal && !base.temporalMatch) continue;
     if (intent.city) {
       const expectedCity = normalizeQuery(intent.city);
       const entityCity = normalizeQuery(String(base.location?.city ?? ''));
@@ -1464,7 +1488,7 @@ export async function autoReviewPendingClaimsDb(sourceRegistryId?: string, limit
   const claimsResult = await pool.query(
     `select c.id, c.subject_name as "subjectName", c.predicate, c.value, c.confidence::float,
             c.target_entity_id as "targetEntityId", d.source_registry_id as "sourceRegistryId",
-            sr.source_type as "sourceType", sr.authority_score::float as "authorityScore",
+            sr.source_type as "sourceType", sr.authority_score::float as "authorityScore", sr.metadata as "sourceMetadata",
             coalesce((select max(rc.score)::float from entity_resolution_candidates rc
                       where rc.claim_id=c.id and rc.status='accepted'),
                      case when c.auto_entity_created or exists (
@@ -1603,7 +1627,7 @@ export async function autoCreateEntitiesDb(sourceRegistryId?: string, limit = 10
   const candidates = await pool.query(
     `select c.id, c.document_id as "documentId", c.subject_name as "subjectName", c.subject_type as "subjectType",
             c.value, c.confidence::float, d.source_registry_id as "sourceRegistryId",
-            sr.source_type as "sourceType", sr.authority_score::float as "authorityScore"
+            sr.source_type as "sourceType", sr.authority_score::float as "authorityScore", sr.metadata as "sourceMetadata"
        from extracted_claims c
        join source_documents d on d.id=c.document_id
        join source_registry sr on sr.id=d.source_registry_id
@@ -1647,6 +1671,8 @@ export async function autoCreateEntitiesDb(sourceRegistryId?: string, limit = 10
     const desc = sibling.rows.find((r) => r.predicate === 'schema:description')?.value;
     const address = sibling.rows.find((r) => r.predicate === 'schema:address')?.value;
     let location: Record<string, unknown> | null = null;
+    const sourceCity = typeof claim.sourceMetadata?.city === 'string' ? String(claim.sourceMetadata.city) : null;
+    if (sourceCity) location = { city: sourceCity, country: 'Türkiye' };
     if (address && typeof address === 'object' && !Array.isArray(address)) {
       const a = address as Record<string, unknown>;
       location = {

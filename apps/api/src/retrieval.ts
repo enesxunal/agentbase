@@ -6,6 +6,7 @@ export type QueryIntent = {
   typeHints: string[];
   facets: string[];
   intent: 'discover' | 'lookup' | 'recommend' | 'compare' | 'unknown';
+  temporal?: { kind: 'today' | 'tomorrow' | 'this_week' | 'this_weekend' | 'upcoming'; from: string; to?: string };
 };
 
 const STOPWORDS = new Set([
@@ -34,6 +35,56 @@ const TYPE_HINTS: Array<[string, string[]]> = [
   ['city', ['sehir','şehir','il','kent']]
 ];
 
+
+function istanbulDateParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Istanbul', year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(date);
+  const get = (type: string) => Number(parts.find((part) => part.type === type)?.value ?? 0);
+  return { year: get('year'), month: get('month'), day: get('day') };
+}
+
+function isoIstanbulDate(year: number, month: number, day: number) {
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${year}-${pad(month)}-${pad(day)}`;
+}
+
+function shiftCalendarDate(year: number, month: number, day: number, delta: number) {
+  const value = new Date(Date.UTC(year, month - 1, day + delta, 12));
+  return { year: value.getUTCFullYear(), month: value.getUTCMonth() + 1, day: value.getUTCDate() };
+}
+
+function temporalIntent(raw: string, normalized: string): QueryIntent['temporal'] {
+  const now = new Date();
+  const current = istanbulDateParts(now);
+  const startOf = (value: { year: number; month: number; day: number }) => `${isoIstanbulDate(value.year, value.month, value.day)}T00:00:00+03:00`;
+  const tomorrow = shiftCalendarDate(current.year, current.month, current.day, 1);
+  if (/\b(bugun|bugün|today)\b/i.test(raw)) {
+    return { kind: 'today', from: startOf(current), to: startOf(tomorrow) };
+  }
+  if (/\b(yarin|yarın|tomorrow)\b/i.test(raw)) {
+    const afterTomorrow = shiftCalendarDate(current.year, current.month, current.day, 2);
+    return { kind: 'tomorrow', from: startOf(tomorrow), to: startOf(afterTomorrow) };
+  }
+  const weekday = new Date(Date.UTC(current.year, current.month - 1, current.day, 12)).getUTCDay();
+  const mondayOffset = weekday === 0 ? -6 : 1 - weekday;
+  const monday = shiftCalendarDate(current.year, current.month, current.day, mondayOffset);
+  if (/\b(bu hafta|this week)\b/i.test(raw)) {
+    const nextMonday = shiftCalendarDate(monday.year, monday.month, monday.day, 7);
+    return { kind: 'this_week', from: startOf(current), to: startOf(nextMonday) };
+  }
+  if (/\b(hafta sonu|haftasonu|bu weekend|this weekend|weekend)\b/i.test(raw)) {
+    const saturday = shiftCalendarDate(monday.year, monday.month, monday.day, 5);
+    const nextMonday = shiftCalendarDate(monday.year, monday.month, monday.day, 7);
+    const from = now.getTime() > new Date(startOf(saturday)).getTime() ? startOf(current) : startOf(saturday);
+    return { kind: 'this_weekend', from, to: startOf(nextMonday) };
+  }
+  if (/\b(yaklasan|yaklaşan|gelecek etkinlik|gelecek etkinlikler|upcoming|etkinlik|konser|festival|sergi|tiyatro)\b/i.test(raw)) {
+    return { kind: 'upcoming', from: now.toISOString() };
+  }
+  return undefined;
+}
+
 export function normalizeQuery(value: string) {
   return value
     .toLocaleLowerCase('tr-TR')
@@ -59,7 +110,7 @@ export function parseQuery(raw: string, knownCities: string[] = []): QueryIntent
   else if (/\b(nedir|kimdir|hakkinda|hakkında|bilgi)\b/i.test(raw)) intent = 'lookup';
   else if (tokens.length) intent = 'discover';
 
-  return { raw, normalized, tokens, city, typeHints: [...new Set(typeHints)], facets: [...new Set(facets)], intent };
+  return { raw, normalized, tokens, city, typeHints: [...new Set(typeHints)], facets: [...new Set(facets)], intent, temporal: temporalIntent(raw, normalized) };
 }
 
 export function facetTerms(facet: string) {
