@@ -12,14 +12,22 @@ import {
   resolveClaimEntityDb,
   enqueueSourceUrlDb,
   markSourceRegistryCrawledDb,
+  markSourceRegistryRefreshFailedDb,
+  prepareSourceRefreshDb,
+  enqueueDueSourceRefreshJobsDb,
   autoCreateEntitiesDb,
   autoReviewPendingClaimsDb,
   createAgentEventDb,
   refreshAllEntityEmbeddingsDb,
   setIngestionJobRunningDb,
-  finishIngestionJobDb
+  finishIngestionJobDb,
+  upsertBusinessDiscoveryCandidateDb,
+  createBusinessDiscoveryRunDb,
+  registerBusinessWebsiteSourcesDb,
+  enqueueDueBusinessDiscoveryJobDb
 } from './db.js';
 import { crawlUrl, extractClaimsAsync, robotsAllows, discoverSameOriginLinks } from './ingestion.js';
+import { safeFetchText } from './fetch_security.js';
 
 const WORKER_ID = process.env.AGENTBASE_WORKER_ID || `${os.hostname()}:${process.pid}`;
 const POLL_MS = Math.max(500, Number(process.env.WORKER_POLL_MS || 1500));
@@ -74,6 +82,7 @@ async function runSourceRegistry(sourceId: string) {
   if (!source.crawlEnabled) return { sourceId, processed: 0, completed: 0, failed: 0, blocked: 0, discovered: 0, skipped: true };
 
   await ensureRollingSourceSeeds(source);
+  await prepareSourceRefreshDb(sourceId);
   const batch = await claimSourceFrontierBatchDb(sourceId, source.maxPagesPerRun);
   const stats = { sourceId, processed: batch.length, completed: 0, failed: 0, blocked: 0, discovered: 0 };
   const sourceOrigin = new URL(source.baseUrl).origin;
@@ -127,7 +136,72 @@ async function runSourceRegistry(sourceId: string) {
   return result;
 }
 
+function normalizeBusinessWebsite(value: unknown) {
+  if (typeof value !== 'string') return null;
+  let raw=value.trim();
+  if (!raw) return null;
+  if (/^www\./i.test(raw)) raw='https://'+raw;
+  try {
+    const url=new URL(raw);
+    if (!['http:','https:'].includes(url.protocol)) return null;
+    url.hash='';
+    return url.toString();
+  } catch { return null; }
+}
+
+function osmAddress(tags: Record<string, unknown>) {
+  const parts=[tags['addr:street'],tags['addr:housenumber'],tags['addr:suburb'],tags['addr:district'],tags['addr:postcode'],tags['addr:city']]
+    .filter((v)=>typeof v==='string' && v.trim()).map(String);
+  return parts.length ? parts.join(' ') : null;
+}
+
+async function runIstanbulBusinessDiscovery(payload: Record<string, unknown>) {
+  const city=String(payload.city || 'İstanbul');
+  if (city !== 'İstanbul') throw new Error('business_discovery_city_not_supported_yet');
+  const limit=Math.max(1,Math.min(500,Number(payload.limit || 100)));
+  const endpoint=String(process.env.OSM_OVERPASS_URL || 'https://overpass-api.de/api/interpreter');
+  const bbox='40.802,28.500,41.350,29.650';
+  const queryLimit=Math.min(1000,limit*2);
+  const query='[out:json][timeout:25];(nwr["amenity"~"^(restaurant|cafe)$"]('+bbox+'););out center tags '+queryLimit+';';
+  const { response, body }=await safeFetchText(endpoint,{
+    method:'POST',
+    headers:{'content-type':'application/x-www-form-urlencoded','user-agent':'AgentBaseBot/0.1 (+https://agentbase.com.tr/bot)'},
+    body:'data='+encodeURIComponent(query)
+  },5*1024*1024);
+  if (!response.ok) throw new Error('overpass_http_'+response.status);
+  const parsed=JSON.parse(body) as { elements?: Array<Record<string, unknown>> };
+  const rows=Array.isArray(parsed.elements) ? parsed.elements : [];
+  let discovered=0; let withWebsite=0;
+  for (const element of rows) {
+    if (discovered >= limit) break;
+    const tags=(element.tags && typeof element.tags==='object' ? element.tags : {}) as Record<string,unknown>;
+    const name=typeof tags.name==='string' ? tags.name.trim() : '';
+    const amenity=tags.amenity === 'cafe' ? 'cafe' : tags.amenity === 'restaurant' ? 'restaurant' : null;
+    if (!name || !amenity) continue;
+    const type=String(element.type || 'node'); const id=String(element.id || '');
+    if (!id) continue;
+    const center=(element.center && typeof element.center==='object' ? element.center : {}) as Record<string,unknown>;
+    const lat=Number(element.lat ?? center.lat); const lon=Number(element.lon ?? center.lon);
+    const website=normalizeBusinessWebsite(tags.website ?? tags['contact:website']);
+    if (website) withWebsite++;
+    await upsertBusinessDiscoveryCandidateDb({
+      provider:'openstreetmap', externalId:type+'/'+id, name, category:amenity, city,
+      district:typeof tags['addr:district']==='string' ? String(tags['addr:district']) : (typeof tags['addr:suburb']==='string' ? String(tags['addr:suburb']) : null),
+      website, telephone:typeof (tags.phone ?? tags['contact:phone'])==='string' ? String(tags.phone ?? tags['contact:phone']) : null,
+      address:osmAddress(tags), latitude:Number.isFinite(lat)?lat:null, longitude:Number.isFinite(lon)?lon:null,
+      sourceUrl:'https://www.openstreetmap.org/'+type+'/'+id, raw:{tags}
+    });
+    discovered++;
+  }
+  const registered=await registerBusinessWebsiteSourcesDb(city,limit);
+  const run=await createBusinessDiscoveryRunDb({provider:'openstreetmap',city,discovered,withWebsite,details:{registeredWebsiteSources:registered.length,attribution:'© OpenStreetMap contributors',license:'ODbL'}});
+  return {runId:run?.id ?? null,city,discovered,withWebsite,registeredWebsiteSources:registered.length};
+}
+
 async function execute(job: { jobType: string; payload: Record<string, unknown> }) {
+  if (job.jobType === 'business_discovery') {
+    return runIstanbulBusinessDiscovery(job.payload);
+  }
   if (job.jobType === 'source_crawl') {
     const sourceId = String(job.payload.sourceId || '');
     if (!sourceId) throw new Error('source_id_required');
@@ -161,8 +235,20 @@ async function execute(job: { jobType: string; payload: Record<string, unknown> 
 
 async function loop() {
   console.log(`[worker] started ${WORKER_ID}`);
+  let lastRefreshSweep = 0;
   while (!stopping) {
-    const job = await claimBackgroundJobDb(WORKER_ID, ['source_crawl','ingest_url','refresh_embeddings']);
+    if (Date.now() - lastRefreshSweep >= 60000) {
+      try {
+        const scheduled = await enqueueDueSourceRefreshJobsDb(20);
+        if (scheduled.length) console.log(`[worker] scheduled ${scheduled.length} source refresh job(s)`);
+        const discovery = await enqueueDueBusinessDiscoveryJobDb('İstanbul', 30);
+        if (discovery) console.log(`[worker] scheduled Istanbul business discovery ${discovery.id}`);
+      } catch (error) {
+        console.error(`[worker] refresh scheduler error`, error);
+      }
+      lastRefreshSweep = Date.now();
+    }
+    const job = await claimBackgroundJobDb(WORKER_ID, ['business_discovery','source_crawl','ingest_url','refresh_embeddings']);
     if (!job) {
       await new Promise((resolve) => setTimeout(resolve, POLL_MS));
       continue;
@@ -176,6 +262,10 @@ async function loop() {
       const message = error instanceof Error ? error.stack || error.message : String(error);
       const delay = Math.min(900, 15 * Math.pow(2, Math.max(0, job.attempts - 1)));
       const next = await failBackgroundJobDb(job.id, message, delay);
+      if (job.jobType === 'source_crawl') {
+        const sourceId = String(job.payload.sourceId || '');
+        if (sourceId) await markSourceRegistryRefreshFailedDb(sourceId);
+      }
       console.error(`[worker] failed ${job.id} status=${next?.status} retry_in=${delay}s`, message);
     }
   }

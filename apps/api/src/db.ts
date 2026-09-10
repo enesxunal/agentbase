@@ -113,9 +113,10 @@ export async function searchEntitiesDb(query: string, type: string | undefined, 
 export async function getEntityDb(idOrSlug: string) {
   if (!pool) return null;
   const entityResult = await pool.query(
-    `select id, slug, type, name, summary, location,
-            created_at as "createdAt", updated_at as "updatedAt"
-       from entities where id = $1 or slug = $1 limit 1`,
+    `select e.id, e.slug, e.type, e.name, e.summary, e.location,
+            e.created_at as "createdAt", e.updated_at as "updatedAt",
+            (select max(f.last_verified_at) from facts f where f.subject_entity_id=e.id and f.is_current=true and f.status='verified') as "lastVerifiedAt"
+       from entities e where e.id = $1 or e.slug = $1 limit 1`,
     [idOrSlug]
   );
   if (!entityResult.rowCount) return null;
@@ -135,7 +136,7 @@ export async function getFactsDb(entityId: string) {
     `select f.id, f.predicate, f.value, f.confidence::float, f.status,
             f.version_group_id as "versionGroupId", f.version_no as "versionNo", f.is_current as "isCurrent",
             f.valid_from as "validFrom", f.valid_to as "validTo",
-            f.last_checked as "lastChecked",
+            f.last_checked as "lastChecked", f.last_verified_at as "lastVerifiedAt",
             coalesce(json_agg(json_build_object(
               'id', s.id,
               'name', s.name,
@@ -762,7 +763,7 @@ export async function promoteAcceptedClaimToFactDb(claimId: string): Promise<Pro
       confidence = Math.min(0.99, Number((Math.max(exact.confidence, finalConfidence) + 0.03).toFixed(3)));
       await client.query(
         `update facts set confidence=$2, status=case when status='conflicting' then status else 'verified' end,
-                          last_checked=now() where id=$1`,
+                          last_checked=now(), last_verified_at=now() where id=$1`,
         [factId, confidence]
       );
       await client.query(
@@ -785,9 +786,9 @@ export async function promoteAcceptedClaimToFactDb(claimId: string): Promise<Pro
 
       factId = `fact_claim_${crypto.randomUUID()}`;
       await client.query(
-        `insert into facts (id, subject_entity_id, predicate, value, confidence, status, last_checked,
+        `insert into facts (id, subject_entity_id, predicate, value, confidence, status, last_checked, last_verified_at,
                             valid_from, version_group_id, version_no, is_current)
-         values ($1,$2,$3,$4::jsonb,$5,$6,now(),coalesce($7,now()),$8,$9,true)`,
+         values ($1,$2,$3,$4::jsonb,$5,$6,now(),case when $6='verified' then now() else null end,coalesce($7,now()),$8,$9,true)`,
         [factId, claim.targetEntityId, claim.predicate, JSON.stringify(claim.value), confidence,
          outcome === 'conflict' ? 'conflicting' : 'verified', claim.fetchedAt, versionGroupId, versionNo]
       );
@@ -1140,7 +1141,8 @@ export async function hybridRetrieveDb(intent: QueryIntent, limit = 10) {
               'value', f.value,
               'confidence', f.confidence::float,
               'status', f.status,
-              'lastChecked', f.last_checked
+              'lastChecked', f.last_checked,
+              'lastVerifiedAt', f.last_verified_at
             )) filter (where f.id is not null), '[]'::json) as facts,
             coalesce(json_agg(distinct jsonb_build_object(
               'id', s.id,
@@ -1411,7 +1413,7 @@ export async function listSourceRegistryDb() {
   if (!pool) return [];
   const result = await pool.query(`select id, name, base_url as "baseUrl", source_type as "sourceType",
     authority_score::float as "authorityScore", crawl_enabled as "crawlEnabled", respect_robots as "respectRobots",
-    max_pages_per_run as "maxPagesPerRun", crawl_delay_ms as "crawlDelayMs", metadata, last_crawled_at as "lastCrawledAt"
+    max_pages_per_run as "maxPagesPerRun", crawl_delay_ms as "crawlDelayMs", refresh_interval_hours as "refreshIntervalHours", next_refresh_at as "nextRefreshAt", last_successful_crawl_at as "lastSuccessfulCrawlAt", last_failed_crawl_at as "lastFailedCrawlAt", metadata, last_crawled_at as "lastCrawledAt"
     from source_registry order by authority_score desc, name`);
   return result.rows;
 }
@@ -1420,7 +1422,7 @@ export async function getSourceRegistryDb(id:string) {
   if (!pool) return null;
   const result = await pool.query(`select id, name, base_url as "baseUrl", source_type as "sourceType",
     authority_score::float as "authorityScore", crawl_enabled as "crawlEnabled", respect_robots as "respectRobots",
-    max_pages_per_run as "maxPagesPerRun", crawl_delay_ms as "crawlDelayMs", metadata, last_crawled_at as "lastCrawledAt"
+    max_pages_per_run as "maxPagesPerRun", crawl_delay_ms as "crawlDelayMs", refresh_interval_hours as "refreshIntervalHours", next_refresh_at as "nextRefreshAt", last_successful_crawl_at as "lastSuccessfulCrawlAt", last_failed_crawl_at as "lastFailedCrawlAt", metadata, last_crawled_at as "lastCrawledAt"
     from source_registry where id=$1`, [id]);
   return result.rows[0] ?? null;
 }
@@ -1453,10 +1455,51 @@ export async function finishSourceFrontierDb(id:string, status:'completed'|'fail
   return result.rows[0] ?? null;
 }
 
+export async function prepareSourceRefreshDb(id:string) {
+  if (!pool) return null;
+  const result = await pool.query(`insert into source_frontier (source_registry_id,url,depth,status,discovered_from)
+    select id,base_url,0,'queued','scheduled_refresh' from source_registry where id=$1
+    on conflict (source_registry_id,url) do update set status='queued', depth=0, last_error=null, updated_at=now()
+    returning id,url,status`, [id]);
+  return result.rows[0] ?? null;
+}
+
 export async function markSourceRegistryCrawledDb(id:string) {
   if (!pool) return null;
-  const result = await pool.query(`update source_registry set last_crawled_at=now(),updated_at=now() where id=$1 returning id,last_crawled_at as "lastCrawledAt"`,[id]);
+  const result = await pool.query(`update source_registry
+    set last_crawled_at=now(), last_successful_crawl_at=now(), last_failed_crawl_at=null,
+        next_refresh_at=case when refresh_interval_hours is null then null else now() + make_interval(hours => refresh_interval_hours) end,
+        updated_at=now()
+    where id=$1 returning id,last_crawled_at as "lastCrawledAt",last_successful_crawl_at as "lastSuccessfulCrawlAt",next_refresh_at as "nextRefreshAt"`,[id]);
   return result.rows[0] ?? null;
+}
+
+export async function markSourceRegistryRefreshFailedDb(id:string) {
+  if (!pool) return null;
+  const result = await pool.query(`update source_registry
+    set last_failed_crawl_at=now(), next_refresh_at=case when refresh_interval_hours is null then null else now() + interval '1 hour' end, updated_at=now()
+    where id=$1 returning id,last_failed_crawl_at as "lastFailedCrawlAt",next_refresh_at as "nextRefreshAt"`, [id]);
+  return result.rows[0] ?? null;
+}
+
+export async function enqueueDueSourceRefreshJobsDb(limit=20) {
+  if (!pool) return [];
+  const result = await pool.query(`with due as (
+      select sr.id
+      from source_registry sr
+      where sr.crawl_enabled=true and sr.refresh_interval_hours is not null
+        and coalesce(sr.next_refresh_at, sr.last_successful_crawl_at + make_interval(hours => sr.refresh_interval_hours), sr.created_at) <= now()
+        and not exists (
+          select 1 from background_jobs j
+          where j.job_type='source_crawl' and j.status in ('queued','running') and j.payload->>'sourceId'=sr.id::text
+        )
+      order by coalesce(sr.next_refresh_at, sr.created_at) asc
+      limit $1
+    )
+    insert into background_jobs (job_type,payload,priority,max_attempts)
+    select 'source_crawl', jsonb_build_object('sourceId',id::text,'reason','scheduled_refresh'), 70, 3 from due
+    returning id, payload, status, run_after as "runAfter"`, [Math.max(1, Math.min(100, limit))]);
+  return result.rows;
 }
 
 const AUTO_REVIEW_POLICY_VERSION = 'official-strict-v1';
@@ -1767,6 +1810,85 @@ export async function getEntityFactsAtDb(entityId: string, at: string) {
     [entityId, at]
   );
   return result.rows;
+}
+
+export type BusinessDiscoveryCandidateInput = {
+  provider: string;
+  externalId: string;
+  name: string;
+  category: 'restaurant'|'cafe';
+  city: string;
+  district?: string|null;
+  website?: string|null;
+  telephone?: string|null;
+  address?: string|null;
+  latitude?: number|null;
+  longitude?: number|null;
+  sourceUrl?: string|null;
+  raw?: Record<string, unknown>;
+};
+
+export async function upsertBusinessDiscoveryCandidateDb(input: BusinessDiscoveryCandidateInput) {
+  if (!pool) return null;
+  const result = await pool.query(`insert into business_discovery_candidates
+    (provider,external_id,name,category,city,district,website,telephone,address,latitude,longitude,source_url,raw,last_seen_at)
+    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,now())
+    on conflict (provider,external_id) do update set
+      name=excluded.name, category=excluded.category, city=excluded.city, district=coalesce(excluded.district,business_discovery_candidates.district),
+      website=coalesce(excluded.website,business_discovery_candidates.website), telephone=coalesce(excluded.telephone,business_discovery_candidates.telephone),
+      address=coalesce(excluded.address,business_discovery_candidates.address), latitude=coalesce(excluded.latitude,business_discovery_candidates.latitude),
+      longitude=coalesce(excluded.longitude,business_discovery_candidates.longitude), source_url=coalesce(excluded.source_url,business_discovery_candidates.source_url),
+      raw=excluded.raw, last_seen_at=now()
+    returning id,provider,external_id as "externalId",name,category,city,district,website,telephone,address,latitude,longitude,source_url as "sourceUrl",status,first_seen_at as "firstSeenAt",last_seen_at as "lastSeenAt"`,
+    [input.provider,input.externalId,input.name,input.category,input.city,input.district??null,input.website??null,input.telephone??null,input.address??null,input.latitude??null,input.longitude??null,input.sourceUrl??null,JSON.stringify(input.raw??{})]);
+  return result.rows[0] ?? null;
+}
+
+export async function createBusinessDiscoveryRunDb(input:{provider:string;city:string;discovered:number;withWebsite:number;details?:Record<string,unknown>}) {
+  if (!pool) return null;
+  const result=await pool.query(`insert into business_discovery_runs (provider,city,discovered,with_website,details)
+    values ($1,$2,$3,$4,$5::jsonb) returning id,provider,city,discovered,with_website as "withWebsite",details,created_at as "createdAt"`,
+    [input.provider,input.city,input.discovered,input.withWebsite,JSON.stringify(input.details??{})]);
+  return result.rows[0] ?? null;
+}
+
+export async function listBusinessDiscoveryCandidatesDb(limit=100, city='İstanbul') {
+  if (!pool) return [];
+  const result=await pool.query(`select id,provider,external_id as "externalId",name,category,city,district,website,telephone,address,latitude,longitude,source_url as "sourceUrl",status,first_seen_at as "firstSeenAt",last_seen_at as "lastSeenAt"
+    from business_discovery_candidates where city=$1 order by (website is not null) desc,last_seen_at desc,name limit $2`,[city,Math.max(1,Math.min(1000,limit))]);
+  return result.rows;
+}
+
+export async function registerBusinessWebsiteSourcesDb(city='İstanbul', limit=100) {
+  if (!pool) return [];
+  const result=await pool.query(`with candidates as (
+      select id,name,category,website from business_discovery_candidates
+      where city=$1 and status='discovered' and website is not null
+      order by last_seen_at desc limit $2
+    ), inserted as (
+      insert into source_registry (name,base_url,source_type,authority_score,crawl_enabled,respect_robots,max_pages_per_run,crawl_delay_ms,metadata,refresh_interval_hours,next_refresh_at)
+      select 'Discovered business source: '||name, website, 'public', 0.65, true, true, 8, 1200,
+             jsonb_build_object('scope','local-business','city',$1,'category',category,'discoveryCandidateId',id::text,'crawlProfile','business-website-v1','ownershipVerified',false,'sourceRole','discovery-candidate'),
+             168, now()
+      from candidates
+      on conflict (base_url) do update set name=excluded.name, source_type=excluded.source_type, authority_score=least(source_registry.authority_score,0.65), metadata=source_registry.metadata || excluded.metadata, refresh_interval_hours=168, next_refresh_at=coalesce(source_registry.next_refresh_at,now()), updated_at=now()
+      returning id,base_url as "baseUrl"
+    )
+    select * from inserted`,[city,Math.max(1,Math.min(500,limit))]);
+  await pool.query(`update business_discovery_candidates set status='enrichment_queued'
+    where city=$1 and status='discovered' and website is not null and website in (select base_url from source_registry where metadata->>'scope'='local-business')`,[city]);
+  return result.rows;
+}
+
+export async function enqueueDueBusinessDiscoveryJobDb(city='İstanbul', intervalDays=30) {
+  if (!pool) return null;
+  const result=await pool.query(`insert into background_jobs (job_type,payload,priority,max_attempts)
+    select 'business_discovery',jsonb_build_object('city',$1::text,'limit',100,'reason','scheduled_discovery'),40,3
+    where not exists (select 1 from background_jobs where job_type='business_discovery' and status in ('queued','running'))
+      and not exists (select 1 from background_jobs where job_type='business_discovery' and status='failed' and created_at > now()-interval '1 hour')
+      and coalesce((select max(created_at) from business_discovery_runs where city=$1::text), to_timestamp(0)) <= now() - make_interval(days => $2::int)
+    returning id,payload,status,run_after as "runAfter"`,[city,Math.max(1,Math.min(365,intervalDays))]);
+  return result.rows[0] ?? null;
 }
 
 export type BackgroundJob = {

@@ -74,7 +74,8 @@ import {
   updateAgentProfileDb,
   createAgentIdentityChallengeDb,
   getAgentIdentityChallengeDb,
-  verifyAgentIdentityChallengeDb
+  verifyAgentIdentityChallengeDb,
+  listBusinessDiscoveryCandidatesDb
 } from "./db.js";
 
 const app = Fastify({
@@ -86,7 +87,7 @@ const corsOrigins = (process.env.CORS_ORIGINS || '').split(',').map((v) => v.tri
 await app.register(cors, {
   origin: process.env.NODE_ENV === 'production' ? corsOrigins : true,
   methods: ['GET','POST','DELETE','OPTIONS'],
-  allowedHeaders: ['content-type','authorization','mcp-protocol-version','mcp-method']
+  allowedHeaders: ['content-type','authorization','mcp-protocol-version','mcp-method','mcp-name']
 });
 await app.register(rateLimit, {
   global: true,
@@ -993,6 +994,27 @@ app.post('/v1/sources/registry/:id/run', { config: { rateLimit: { max: 10, timeW
   if (!job) return reply.status(503).send({ error: 'database_required' });
   await createAgentEventDb({ agentId: agent.id, eventType: 'source_crawl_queued', payload: { message: source.name + ' kaynağı tarama kuyruğuna eklendi', sourceId: id, jobId: job.id } });
   return reply.status(202).send({ source, job });
+});
+
+app.post('/v1/business-discovery/run', { config: { rateLimit: { max: 5, timeWindow: '1 hour' } } }, async (request, reply) => {
+  const agent = await requireAgent(request);
+  if (!agent || !agent.verified) return reply.status(403).send({ error: 'verified_agent_required' });
+  const schema = z.object({ city: z.literal('İstanbul').default('İstanbul'), limit: z.number().int().min(1).max(500).default(100) });
+  const parsed = schema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.status(400).send({ error: 'invalid_request', details: parsed.error.flatten() });
+  const job = await enqueueBackgroundJobDb('business_discovery', { ...parsed.data, requestedByAgentId: agent.id }, { priority: 40, maxAttempts: 3 });
+  if (!job) return reply.status(503).send({ error: 'database_required' });
+  await createAgentEventDb({ agentId: agent.id, eventType: 'business_discovery_queued', payload: { message: 'İstanbul restoran/kafe keşif turu kuyruğa eklendi', jobId: job.id, limit: parsed.data.limit } });
+  return reply.status(202).send({ job });
+});
+
+app.get('/v1/business-discovery/candidates', async (request, reply) => {
+  const agent = await requireAgent(request);
+  if (!agent || !agent.verified) return reply.status(403).send({ error: 'verified_agent_required' });
+  const q=request.query as {limit?:string;city?:string};
+  const city=q.city || 'İstanbul';
+  const limit=Math.max(1,Math.min(1000,Number(q.limit || 100)));
+  return { city, candidates: await listBusinessDiscoveryCandidatesDb(limit, city) };
 });
 
 app.get('/v1/jobs/:id', async (request, reply) => {
