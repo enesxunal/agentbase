@@ -25,10 +25,29 @@ const WORKER_ID = process.env.AGENTBASE_WORKER_ID || `${os.hostname()}:${process
 const POLL_MS = Math.max(500, Number(process.env.WORKER_POLL_MS || 1500));
 let stopping = false;
 
+function dateInIstanbul(offsetDays = 0) {
+  const date = new Date(Date.now() + offsetDays * 86400000);
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Istanbul', year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(date);
+  const get = (type: string) => parts.find((part) => part.type === type)?.value || '';
+  return `${get('year')}-${get('month')}-${get('day')}`;
+}
+
+async function ensureRollingSourceSeeds(source: { id: string; baseUrl: string; metadata?: Record<string, unknown> }) {
+  const days = Number(source.metadata?.rollingDateWindowDays ?? 0);
+  if (!Number.isFinite(days) || days <= 0) return;
+  const url = new URL(source.baseUrl);
+  url.searchParams.set('start_date', dateInIstanbul(0));
+  url.searchParams.set('end_date', dateInIstanbul(Math.min(365, Math.max(1, Math.round(days)))));
+  await enqueueSourceUrlDb(source.id, url.toString(), 0);
+}
+
 type CrawlMetadata = {
   allowedPathPrefixes?: string[];
   deniedPathPrefixes?: string[];
   allowedQueryKeys?: string[];
+  crawlProfile?: string;
 };
 
 function normalizeDiscoveredUrl(rawUrl: string, metadata: CrawlMetadata) {
@@ -40,6 +59,11 @@ function normalizeDiscoveredUrl(rawUrl: string, metadata: CrawlMetadata) {
       if (!metadata.allowedQueryKeys.includes(key)) url.searchParams.delete(key);
     }
   }
+  if (metadata.crawlProfile === 'ibb-culture-events-current-v2') {
+    const isDetail = /^\/etkinliklerimiz\/\d+\//.test(url.pathname);
+    const isWindowPage = url.pathname === '/etkinliklerimiz/ara' && url.searchParams.has('start_date') && url.searchParams.has('end_date');
+    if (!isDetail && !isWindowPage) return null;
+  }
   url.hash = '';
   return url.toString();
 }
@@ -49,6 +73,7 @@ async function runSourceRegistry(sourceId: string) {
   if (!source) throw new Error('source_registry_not_found');
   if (!source.crawlEnabled) return { sourceId, processed: 0, completed: 0, failed: 0, blocked: 0, discovered: 0, skipped: true };
 
+  await ensureRollingSourceSeeds(source);
   const batch = await claimSourceFrontierBatchDb(sourceId, source.maxPagesPerRun);
   const stats = { sourceId, processed: batch.length, completed: 0, failed: 0, blocked: 0, discovered: 0 };
   const sourceOrigin = new URL(source.baseUrl).origin;
