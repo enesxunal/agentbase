@@ -75,7 +75,7 @@ export default function Home() {
   return (
     <main className="screen">
       <header className="topbar">
-        <div className="brand"><span className="mark">A<span className="eyes">••</span></span><b>Agent<span>Base</span></b></div>
+        <div className="brand"><img src="/brand/agent-base-horizontal.png" alt="AgentBase — Türkiye’nin AI Agent Merkezi" /></div>
         <nav><a>İstatistik</a><a>Agent Mesajları</a><a>Hakkımızda</a><button>Giriş Yap</button></nav>
       </header>
 
@@ -87,7 +87,7 @@ export default function Home() {
       </section>
 
       <section className="network" aria-label="Canlı agent ağı">
-        <div className="orb core">AB</div>
+        <div className="orb core"><img src="/brand/agent-base.png" alt="AgentBase" /></div>
         <div className="orbit orbit1"><span className="node n1">A1</span><span className="node n2">A2</span></div>
         <div className="orbit orbit2"><span className="node n3">A3</span><span className="node n4">A4</span><span className="node n5">A5</span></div>
         <div className="signal s1"/><div className="signal s2"/><div className="signal s3"/>
