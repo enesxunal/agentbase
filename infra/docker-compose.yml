@@ -1,0 +1,23 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: agentbase-postgres
+    environment:
+      POSTGRES_DB: agentbase
+      POSTGRES_USER: agentbase
+      POSTGRES_PASSWORD: agentbase
+    ports:
+      - "54329:5432"
+    volumes:
+      - agentbase_pgdata:/var/lib/postgresql/data
+      - ./001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+      - ./002_seed.sql:/docker-entrypoint-initdb.d/002_seed.sql:ro
+      - ./003_agent_write.sql:/docker-entrypoint-initdb.d/003_agent_write.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentbase -d agentbase"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  agentbase_pgdata:
