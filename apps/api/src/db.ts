@@ -30,6 +30,16 @@ export type DbAgent = {
   reputation: number;
   createdAt: string;
   updatedAt: string;
+  organization?: string | null;
+  domain?: string | null;
+  agentCardUrl?: string | null;
+  capabilities?: unknown[];
+  protocols?: string[];
+  identityTier?: string;
+  verificationMethod?: string | null;
+  verifiedAt?: string | null;
+  lastSeenAt?: string | null;
+  metadata?: Record<string, unknown>;
 };
 
 export async function dbHealth() {
@@ -179,7 +189,9 @@ export async function getRelationsDb(entityId: string) {
 export async function listAgentsDb(limit = 100) {
   if (!pool) return [];
   const result = await pool.query(
-    `select id, name, developer, website, description, verified,
+    `select id, name, developer, website, description, verified, organization, domain,
+            agent_card_url as "agentCardUrl", capabilities, protocols, identity_tier as "identityTier",
+            verification_method as "verificationMethod", verified_at as "verifiedAt", last_seen_at as "lastSeenAt", metadata,
             reputation::float, created_at as "createdAt", updated_at as "updatedAt"
        from agents order by verified desc, reputation desc, created_at desc limit $1`,
     [limit]
@@ -190,7 +202,9 @@ export async function listAgentsDb(limit = 100) {
 export async function getAgentDb(id: string) {
   if (!pool) return null;
   const result = await pool.query(
-    `select id, name, developer, website, description, verified,
+    `select id, name, developer, website, description, verified, organization, domain,
+            agent_card_url as "agentCardUrl", capabilities, protocols, identity_tier as "identityTier",
+            verification_method as "verificationMethod", verified_at as "verifiedAt", last_seen_at as "lastSeenAt", metadata,
             reputation::float, created_at as "createdAt", updated_at as "updatedAt"
        from agents where id = $1 limit 1`,
     [id]
@@ -204,16 +218,98 @@ export async function createAgentDb(input: {
   developer?: string;
   website?: string;
   description?: string;
+  organization?: string;
+  domain?: string;
+  agentCardUrl?: string;
+  capabilities?: unknown[];
+  protocols?: string[];
 }) {
   if (!pool) return null;
   const result = await pool.query(
-    `insert into agents (id, name, developer, website, description)
-     values ($1, $2, $3, $4, $5)
-     returning id, name, developer, website, description, verified,
+    `insert into agents (id, name, developer, website, description, organization, domain, agent_card_url, capabilities, protocols)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb)
+     returning id, name, developer, website, description, verified, organization, domain,
+               agent_card_url as "agentCardUrl", capabilities, protocols, identity_tier as "identityTier",
                reputation::float, created_at as "createdAt", updated_at as "updatedAt"`,
-    [input.id, input.name, input.developer ?? null, input.website ?? null, input.description ?? null]
+    [input.id, input.name, input.developer ?? null, input.website ?? null, input.description ?? null,
+     input.organization ?? null, input.domain ?? null, input.agentCardUrl ?? null, JSON.stringify(input.capabilities ?? []), JSON.stringify(input.protocols ?? ['mcp'])]
   );
   return result.rows[0] as DbAgent;
+}
+
+
+export async function touchAgentSeenDb(agentId: string) {
+  if (!pool) return null;
+  const result = await pool.query(`update agents set last_seen_at=now(), updated_at=now() where id=$1 returning last_seen_at as "lastSeenAt"`, [agentId]);
+  return result.rows[0] ?? null;
+}
+
+export async function getAgentRegistryStatsDb() {
+  if (!pool) return null;
+  const result = await pool.query(`select count(*)::int as total, count(*) filter (where verified)::int as verified,
+    count(*) filter (where identity_tier in ('domain_verified','organization_verified','trusted'))::int as "identityVerified",
+    count(*) filter (where last_seen_at >= now() - interval '24 hours')::int as "active24h" from agents`);
+  return result.rows[0] ?? null;
+}
+
+export async function updateAgentProfileDb(agentId: string, input: { organization?: string|null; domain?: string|null; agentCardUrl?: string|null; capabilities?: unknown[]; protocols?: string[]; metadata?: Record<string,unknown> }) {
+  if (!pool) return null;
+  const result = await pool.query(`update agents set
+    organization=coalesce($2,organization), domain=coalesce($3,domain), agent_card_url=coalesce($4,agent_card_url),
+    capabilities=coalesce($5::jsonb,capabilities), protocols=coalesce($6::jsonb,protocols), metadata=coalesce($7::jsonb,metadata), updated_at=now()
+    where id=$1 returning id,name,developer,website,description,verified,organization,domain,agent_card_url as "agentCardUrl",capabilities,protocols,
+      identity_tier as "identityTier",verification_method as "verificationMethod",verified_at as "verifiedAt",last_seen_at as "lastSeenAt",metadata,reputation::float`,
+    [agentId,input.organization ?? null,input.domain ?? null,input.agentCardUrl ?? null,input.capabilities ? JSON.stringify(input.capabilities) : null,input.protocols ? JSON.stringify(input.protocols) : null,input.metadata ? JSON.stringify(input.metadata) : null]);
+  return result.rows[0] ?? null;
+}
+
+
+export async function createAgentIdentityChallengeDb(agentId: string, domain: string, challengeToken: string, ttlMinutes = 30) {
+  if (!pool) return null;
+  const result = await pool.query(
+    `insert into agent_identity_challenges (agent_id,challenge_type,domain,challenge_token,expires_at)
+     values ($1,'domain_http',$2,$3,now() + make_interval(mins => $4))
+     returning id,agent_id as "agentId",challenge_type as "challengeType",domain,challenge_token as "challengeToken",
+       status,expires_at as "expiresAt",created_at as "createdAt"`,
+    [agentId, domain, challengeToken, ttlMinutes]
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function getAgentIdentityChallengeDb(agentId: string, challengeId: string) {
+  if (!pool) return null;
+  const result = await pool.query(
+    `select id,agent_id as "agentId",challenge_type as "challengeType",domain,challenge_token as "challengeToken",status,
+      expires_at as "expiresAt",verified_at as "verifiedAt",created_at as "createdAt"
+      from agent_identity_challenges where id=$1 and agent_id=$2`, [challengeId, agentId]
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function verifyAgentIdentityChallengeDb(agentId: string, challengeId: string) {
+  if (!pool) return null;
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const challenge = await client.query(
+      `update agent_identity_challenges set status='verified',verified_at=now()
+       where id=$1 and agent_id=$2 and status='pending' and expires_at > now()
+       returning id,domain,verified_at as "verifiedAt"`, [challengeId, agentId]
+    );
+    if (!challenge.rowCount) { await client.query('rollback'); return null; }
+    const agent = await client.query(
+      `update agents set domain=$2,verified=true,identity_tier=case when identity_tier='trusted' then 'trusted' else 'domain_verified' end,
+        verification_method='domain_http',verified_at=coalesce(verified_at,now()),updated_at=now()
+       where id=$1 returning id,name,developer,website,description,verified,organization,domain,agent_card_url as "agentCardUrl",capabilities,protocols,
+        identity_tier as "identityTier",verification_method as "verificationMethod",verified_at as "verifiedAt",last_seen_at as "lastSeenAt",metadata,reputation::float`,
+      [agentId, challenge.rows[0].domain]
+    );
+    await client.query('commit');
+    return { challenge: challenge.rows[0], agent: agent.rows[0] };
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally { client.release(); }
 }
 
 export async function createAgentTokenDb(agentId: string, tokenHash: string, label = "default") {

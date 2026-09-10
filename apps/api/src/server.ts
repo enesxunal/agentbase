@@ -7,6 +7,7 @@ import { entities, sources } from "./data.js";
 import { crawlUrl, extractClaimsAsync, robotsAllows, discoverSameOriginLinks } from "./ingestion.js";
 import { parseQuery } from "./retrieval.js";
 import { mcpNodeHandler } from "./mcp_server.js";
+import { safeFetchText } from "./fetch_security.js";
 import {
   authenticateAgentTokenDb,
   createAgentDb,
@@ -67,7 +68,13 @@ import {
   rotateAgentTokenDb,
   enqueueBackgroundJobDb,
   getBackgroundJobDb,
-  listBackgroundJobsDb
+  listBackgroundJobsDb,
+  touchAgentSeenDb,
+  getAgentRegistryStatsDb,
+  updateAgentProfileDb,
+  createAgentIdentityChallengeDb,
+  getAgentIdentityChallengeDb,
+  verifyAgentIdentityChallengeDb
 } from "./db.js";
 
 const app = Fastify({
@@ -97,7 +104,16 @@ const memoryAgents = [
     website: "https://agentbase.com.tr",
     description: "Kaynak ve güncellik doğrulama agent'ı",
     verified: true,
-    reputation: 98
+    reputation: 98,
+    organization: "AgentBase",
+    domain: "agentbase.com.tr",
+    capabilities: ["search", "retrieve", "verify"],
+    protocols: ["mcp", "rest"],
+    identityTier: "trusted",
+    verificationMethod: "internal",
+    verifiedAt: null,
+    lastSeenAt: null,
+    agentCardUrl: null
   }
 ];
 
@@ -132,7 +148,9 @@ function hashToken(token: string) {
 async function requireAgent(request: FastifyRequest) {
   const auth = request.headers.authorization;
   if (!auth?.startsWith("Bearer ")) return null;
-  return authenticateAgentTokenDb(hashToken(auth.slice(7).trim()));
+  const agent = await authenticateAgentTokenDb(hashToken(auth.slice(7).trim()));
+  if (agent) void touchAgentSeenDb(agent.id);
+  return agent;
 }
 
 function searchMemory(query: string, type?: string, limit = 10) {
@@ -422,13 +440,26 @@ app.get("/v1/agents/:id/agent-card.json", async (request, reply) => {
   const { id } = request.params as { id: string };
   const agent = await getAgentDb(id) ?? memoryAgents.find((item) => item.id === id);
   if (!agent) return reply.status(404).send({ error: "agent_not_found" });
+  const publicBase = (process.env.PUBLIC_WEB_URL || 'https://agentbase.com.tr').replace(/\/$/, '');
   return {
     name: agent.name,
     description: agent.description,
-    url: `https://agentbase.com.tr/agents/${agent.id}`,
-    version: "0.1.0",
-    capabilities: { streaming: false },
-    skills: [{ id: "agentbase-access", name: "AgentBase access", description: agent.description ?? "AgentBase agent" }]
+    url: `${publicBase}/agents/${agent.id}`,
+    version: "0.2.0",
+    capabilities: { streaming: false, agentbase: agent.capabilities ?? [] },
+    skills: (agent.capabilities?.length ? agent.capabilities : ['agentbase-access']).map((capability: unknown) => ({ id: String(capability), name: String(capability), description: agent.description ?? "AgentBase agent" })),
+    extensions: {
+      agentbase: {
+        agentId: agent.id,
+        verified: agent.verified,
+        identityTier: agent.identityTier ?? 'registered',
+        organization: agent.organization ?? null,
+        domain: agent.domain ?? null,
+        reputation: agent.reputation,
+        protocols: agent.protocols ?? ['mcp'],
+        lastSeenAt: agent.lastSeenAt ?? null
+      }
+    }
   };
 });
 
@@ -436,7 +467,12 @@ const registerAgentSchema = z.object({
   name: z.string().min(2).max(80),
   developer: z.string().min(2).max(120).optional(),
   website: z.string().url().optional(),
-  description: z.string().max(500).optional()
+  description: z.string().max(500).optional(),
+  organization: z.string().min(2).max(160).optional(),
+  domain: z.string().min(3).max(253).optional(),
+  agentCardUrl: z.string().url().optional(),
+  capabilities: z.array(z.string().min(1).max(80)).max(50).default([]),
+  protocols: z.array(z.enum(['mcp','a2a','rest'])).max(10).default(['mcp'])
 });
 
 app.post("/v1/agents/register", { config: { rateLimit: { max: 5, timeWindow: "1 minute" } } }, async (request, reply) => {
@@ -457,6 +493,96 @@ app.post("/v1/agents/register", { config: { rateLimit: { max: 5, timeWindow: "1 
     token,
     tokenWarning: "Bu token yalnızca bir kez gösterilir. Güvenli bir yerde saklayın."
   });
+});
+
+
+
+app.get('/v1/agents/registry/stats', async () => {
+  const stats = await getAgentRegistryStatsDb();
+  return stats ?? { total: memoryAgents.length, verified: memoryAgents.filter((a) => a.verified).length, identityVerified: 0, active24h: 0 };
+});
+
+app.get('/v1/agents/:id/registry-profile', async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const agent = await getAgentDb(id);
+  if (!agent) return reply.status(404).send({ error: 'agent_not_found' });
+  return {
+    id: agent.id,
+    name: agent.name,
+    developer: agent.developer,
+    organization: agent.organization ?? null,
+    website: agent.website,
+    domain: agent.domain ?? null,
+    description: agent.description,
+    verified: agent.verified,
+    identityTier: agent.identityTier ?? 'registered',
+    verificationMethod: agent.verificationMethod ?? null,
+    verifiedAt: agent.verifiedAt ?? null,
+    reputation: agent.reputation,
+    capabilities: agent.capabilities ?? [],
+    protocols: agent.protocols ?? ['mcp'],
+    agentCardUrl: agent.agentCardUrl ?? null,
+    lastSeenAt: agent.lastSeenAt ?? null,
+    createdAt: agent.createdAt
+  };
+});
+
+const agentProfileSchema = z.object({
+  organization: z.string().min(2).max(160).nullable().optional(),
+  domain: z.string().min(3).max(253).nullable().optional(),
+  agentCardUrl: z.string().url().nullable().optional(),
+  capabilities: z.array(z.string().min(1).max(80)).max(50).optional(),
+  protocols: z.array(z.enum(['mcp','a2a','rest'])).max(10).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional()
+});
+
+app.post('/v1/agents/me/profile', async (request, reply) => {
+  const agent = await requireAgent(request);
+  if (!agent) return reply.status(401).send({ error: 'invalid_agent_token' });
+  const parsed = agentProfileSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.status(400).send({ error: 'invalid_agent_profile', details: parsed.error.flatten() });
+  const updated = await updateAgentProfileDb(agent.id, parsed.data);
+  return updated ?? reply.status(503).send({ error: 'database_required' });
+});
+
+const domainChallengeSchema = z.object({ domain: z.string().min(3).max(253).transform((v) => v.toLowerCase().replace(/^https?:\/\//,'').replace(/\/$/,'')) });
+
+app.post('/v1/agents/me/verify-domain', { config: { rateLimit: { max: 5, timeWindow: '1 hour' } } }, async (request, reply) => {
+  const agent = await requireAgent(request);
+  if (!agent) return reply.status(401).send({ error: 'invalid_agent_token' });
+  const parsed = domainChallengeSchema.safeParse(request.body);
+  if (!parsed.success || parsed.data.domain.includes('/')) return reply.status(400).send({ error: 'invalid_domain' });
+  const challengeToken = `ab_verify_${randomBytes(24).toString('base64url')}`;
+  const challenge = await createAgentIdentityChallengeDb(agent.id, parsed.data.domain, challengeToken, 30);
+  if (!challenge) return reply.status(503).send({ error: 'database_required' });
+  return reply.status(201).send({
+    challengeId: challenge.id,
+    domain: challenge.domain,
+    verificationUrl: `https://${challenge.domain}/.well-known/agentbase-verification.txt`,
+    expectedContent: challenge.challengeToken,
+    expiresAt: challenge.expiresAt
+  });
+});
+
+app.post('/v1/agents/me/verify-domain/:challengeId/check', { config: { rateLimit: { max: 10, timeWindow: '1 hour' } } }, async (request, reply) => {
+  const agent = await requireAgent(request);
+  if (!agent) return reply.status(401).send({ error: 'invalid_agent_token' });
+  const { challengeId } = request.params as { challengeId: string };
+  const challenge = await getAgentIdentityChallengeDb(agent.id, challengeId);
+  if (!challenge) return reply.status(404).send({ error: 'verification_challenge_not_found' });
+  if (challenge.status !== 'pending') return reply.status(409).send({ error: 'verification_challenge_not_pending', status: challenge.status });
+  if (new Date(challenge.expiresAt).getTime() <= Date.now()) return reply.status(410).send({ error: 'verification_challenge_expired' });
+  const verificationUrl = `https://${challenge.domain}/.well-known/agentbase-verification.txt`;
+  try {
+    const { response, body } = await safeFetchText(verificationUrl, { headers: { accept: 'text/plain' } }, 4096);
+    if (!response.ok || body.trim() !== challenge.challengeToken) return reply.status(409).send({ error: 'domain_verification_failed' });
+    const verified = await verifyAgentIdentityChallengeDb(agent.id, challengeId);
+    if (!verified) return reply.status(409).send({ error: 'domain_verification_failed' });
+    await createAgentEventDb({ agentId: agent.id, eventType: 'agent_identity_verified', payload: { message: `${agent.name} alan adini dogruladi`, domain: challenge.domain } });
+    return { verified: true, identityTier: verified.agent.identityTier, domain: challenge.domain, agent: verified.agent };
+  } catch (error) {
+    return reply.status(409).send({ error: 'domain_verification_failed', reason: error instanceof Error ? error.message : String(error) });
+  }
 });
 
 const managedTokenSchema = z.object({
