@@ -1444,6 +1444,10 @@ const AUTO_REVIEW_PREDICATES = new Set([
   'schema:email',
   'schema:url',
   'schema:openingHours',
+  'schema:startDate',
+  'schema:endDate',
+  'schema:location',
+  'schema:eventStatus',
   'schema:servesCuisine',
   'schema:priceRange'
 ]);

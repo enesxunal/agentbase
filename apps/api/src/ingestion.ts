@@ -109,13 +109,25 @@ export async function crawlUrl(url: string): Promise<CrawledDocument> {
   const description = $('meta[name="description"]').attr('content')?.trim() || null;
   const rawText = normalizeText($('main').text() || $('article').text() || $('body').text()).slice(0, 250000);
   const jsonld = parseJsonLd($);
+  let adapterMetadata: Record<string, unknown> = {};
+  try {
+    const target = new URL(finalUrl);
+    if (target.hostname === 'kultursanat.istanbul' && /^\/etkinliklerimiz\/\d+\//.test(target.pathname)) {
+      const venue = normalizeText($('a[href*="/mekanlarimiz/"]').first().text()) || null;
+      const bodyText = normalizeText($('body').text());
+      const startDateRaw = bodyText.match(/Başlangıç Tarihi:\s*(\d{1,2}\s+[A-Za-zÇĞİÖŞÜçğıöşü]{3}\s+\d{4}(?:\s*[-–]\s*[A-Za-zÇĞİÖŞÜçğıöşü]+)?\s+\d{1,2}:\d{2})/i)?.[1]?.trim() || null;
+      adapterMetadata = { sourceAdapter: 'ibb-culture-event-v1', eventVenue: venue, eventStartDateRaw: startDateRaw };
+    }
+  } catch {}
+
   const metadata = {
     language: $('html').attr('lang') || null,
     h1: normalizeText($('h1').first().text()) || null,
     ogTitle: $('meta[property="og:title"]').attr('content') || null,
     ogDescription: $('meta[property="og:description"]').attr('content') || null,
     ogType: $('meta[property="og:type"]').attr('content') || null,
-    labeledPairs: collectLabeledPairs($)
+    labeledPairs: collectLabeledPairs($),
+    ...adapterMetadata
   };
 
   return {
@@ -194,10 +206,45 @@ function extractOfficialMuseumClaims(document: CrawledDocument, subjectName: str
   return claims;
 }
 
+function parseTurkishEventDate(value: string) {
+  const match = value.match(/(\d{1,2})\s+(Oca|Şub|Mar|Nis|May|Haz|Tem|Ağu|Eyl|Eki|Kas|Ara)\s+(\d{4})\s+(\d{1,2}):(\d{2})/i);
+  if (!match) return null;
+  const months: Record<string, number> = { oca:1, şub:2, mar:3, nis:4, may:5, haz:6, tem:7, ağu:8, eyl:9, eki:10, kas:11, ara:12 };
+  const month = months[match[2].toLocaleLowerCase('tr-TR')];
+  if (!month) return null;
+  const pad = (n: string | number) => String(n).padStart(2, '0');
+  return `${match[3]}-${pad(month)}-${pad(match[1])}T${pad(match[4])}:${match[5]}:00+03:00`;
+}
+
+function extractIbbCultureEventClaims(document: CrawledDocument, subjectName: string | null) {
+  const claims: Array<{ subjectName: string | null; subjectType?: string | null; predicate: string; value: unknown; confidence: number; evidence?: string }> = [];
+  if (!subjectName) return claims;
+  let target: URL;
+  try { target = new URL(document.url); } catch { return claims; }
+  if (target.hostname !== 'kultursanat.istanbul' || !/^\/etkinliklerimiz\/\d+\//.test(target.pathname)) return claims;
+
+  const cleanName = subjectName.replace(/\s*\|\s*İBB Kültür Sanat\s*$/i, '').trim();
+  const text = document.rawText;
+  const startRaw = typeof document.metadata?.eventStartDateRaw === 'string'
+    ? document.metadata.eventStartDateRaw
+    : text.match(/Başlangıç Tarihi:\s*(\d{1,2}\s+[A-Za-zÇĞİÖŞÜçğıöşü]{3}\s+\d{4}(?:\s*[-–]\s*[A-Za-zÇĞİÖŞÜçğıöşü]+)?\s+\d{1,2}:\d{2})/i)?.[1]?.trim() || null;
+  const normalizedStartRaw = startRaw?.replace(/\s*[-–]\s*[A-Za-zÇĞİÖŞÜçğıöşü]+(?=\s+\d{1,2}:\d{2}$)/, '') ?? null;
+  const startDate = normalizedStartRaw ? parseTurkishEventDate(normalizedStartRaw) : null;
+  const location = typeof document.metadata?.eventVenue === 'string' ? document.metadata.eventVenue.trim() : null;
+
+  const base = { subjectName: cleanName, subjectType: 'Event' };
+  claims.push({ ...base, predicate: 'schema:name', value: cleanName, confidence: 0.98, evidence: 'Official IBB Kultur Sanat event page title' });
+  claims.push({ ...base, predicate: 'schema:url', value: document.canonicalUrl || document.url, confidence: 0.98, evidence: 'Official IBB Kultur Sanat event page URL' });
+  if (startDate) claims.push({ ...base, predicate: 'schema:startDate', value: startDate, confidence: 0.97, evidence: `Official IBB Kultur Sanat start date: ${startRaw}` });
+  if (location) claims.push({ ...base, predicate: 'schema:location', value: location, confidence: 0.94, evidence: 'Official IBB Kultur Sanat event venue' });
+  return claims;
+}
+
 export function extractClaims(document: CrawledDocument) {
   const claims: Array<{ subjectName: string | null; subjectType?: string | null; predicate: string; value: unknown; confidence: number; evidence?: string }> = [];
   const pageSubjectName = derivePageSubjectName(document);
   claims.push(...extractOfficialMuseumClaims(document, pageSubjectName));
+  claims.push(...extractIbbCultureEventClaims(document, pageSubjectName));
 
   for (const node of document.jsonld) {
     const items = typeof node === 'object' && node && '@graph' in (node as Record<string, unknown>)
