@@ -6,8 +6,18 @@ import { facetTerms, normalizeQuery, type QueryIntent } from "./retrieval.js";
 
 const { Pool } = pg;
 
+const databaseSsl = process.env.DATABASE_SSL === 'true'
+  ? { rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false' }
+  : undefined;
+
 export const pool = process.env.DATABASE_URL
-  ? new Pool({ connectionString: process.env.DATABASE_URL, max: 10 })
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      max: Math.max(1, Number(process.env.DATABASE_POOL_MAX || 10)),
+      idleTimeoutMillis: Math.max(1000, Number(process.env.DATABASE_IDLE_TIMEOUT_MS || 30000)),
+      connectionTimeoutMillis: Math.max(1000, Number(process.env.DATABASE_CONNECT_TIMEOUT_MS || 10000)),
+      ssl: databaseSsl
+    })
   : null;
 
 export type DbAgent = {

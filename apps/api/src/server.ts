@@ -229,6 +229,14 @@ app.get("/health", async () => ({
   database: await dbHealth()
 }));
 
+app.get("/ready", async (_request, reply) => {
+  const database = await dbHealth();
+  if (database.mode !== 'postgres' || !database.ok) {
+    return reply.status(503).send({ ok: false, ready: false, database });
+  }
+  return { ok: true, ready: true, database };
+});
+
 app.get("/v1/stats", async () => {
   const db = await getDbStats();
   if (db) return { ...db, mode: "postgres" };
@@ -897,3 +905,24 @@ app.all("/mcp", async (request, reply) => {
 
 const port = Number(process.env.PORT || 4000);
 await app.listen({ port, host: "0.0.0.0" });
+
+let closing = false;
+async function shutdown(signal: string) {
+  if (closing) return;
+  closing = true;
+  app.log.info({ signal }, 'graceful shutdown started');
+  const timeout = setTimeout(() => {
+    app.log.error('graceful shutdown timed out');
+    process.exit(1);
+  }, Math.max(1000, Number(process.env.SHUTDOWN_TIMEOUT_MS || 10000)));
+  timeout.unref();
+  try {
+    await app.close();
+    process.exit(0);
+  } catch (error) {
+    app.log.error(error, 'graceful shutdown failed');
+    process.exit(1);
+  }
+}
+process.once('SIGTERM', () => { void shutdown('SIGTERM'); });
+process.once('SIGINT', () => { void shutdown('SIGINT'); });

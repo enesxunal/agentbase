@@ -10,10 +10,18 @@ if (!databaseUrl) {
 }
 
 const migrationsDir = path.resolve(process.cwd(), '../../infra/migrations');
-const client = new Client({ connectionString: databaseUrl });
+const client = new Client({
+  connectionString: databaseUrl,
+  ssl: process.env.DATABASE_SSL === 'true'
+    ? { rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false' }
+    : undefined
+});
 await client.connect();
 
+const migrationLockKey = 72419531;
+
 try {
+  await client.query('select pg_advisory_lock($1)', [migrationLockKey]);
   await client.query(`
     create table if not exists schema_migrations (
       filename text primary key,
@@ -73,5 +81,6 @@ try {
 
   console.log(`migrations complete (${files.length})`);
 } finally {
+  try { await client.query('select pg_advisory_unlock($1)', [migrationLockKey]); } catch {}
   await client.end();
 }
